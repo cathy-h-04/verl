@@ -60,6 +60,16 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
+# Phase profiler for energy efficiency tracking (SUB-PHASE VERSION)
+try:
+    import sys
+    sys.path.insert(0, '/home/cathxhou/projects/verl_research/profiling_scripts')
+    from verl_subphase_profiler import SubPhaseProfiler as PhaseProfiler
+    PHASE_PROFILER_AVAILABLE = True
+except ImportError:
+    PHASE_PROFILER_AVAILABLE = False
+    print("Warning: Sub-phase profiler not available.")
+
 
 @dataclass
 class ResourcePoolManager:
@@ -344,6 +354,20 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+        # Initialize phase profiler
+        self.phase_profiler = None
+        if PHASE_PROFILER_AVAILABLE and self.config.trainer.get("enable_phase_profiling", False):
+            experiment_name = os.environ.get("EXPERIMENT_NAME")
+            assert experiment_name is not None, "EXPERIMENT_NAME must be set by launcher"
+            granularity = self.config.trainer.get("phase_profiling_granularity", "phase")
+            self.phase_profiler = PhaseProfiler(
+                experiment_name=experiment_name,
+                enable=True,
+                granularity=granularity,
+            )
+            print(f"✓ Phase profiler enabled for experiment: {experiment_name} (granularity: {granularity})")
+
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1049,6 +1073,10 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
+                    reward_extra_infos_dict = {}
+                    # ===== Phase 1: rollout =====
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_start("rollout", iteration=self.global_steps)
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
@@ -1102,6 +1130,15 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    # End Phase 1: rollout
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_end("rollout")
+                        self.phase_profiler.log_timings(timing_raw, "rollout", self.global_steps)
+
+                    # ===== Phase 2: rl_policy =====
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_start("rl_policy", iteration=self.global_steps)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1215,6 +1252,16 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                    # End Phase 2: rl_policy
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_end("rl_policy")
+                        self.phase_profiler.log_timings(timing_raw, "rl_policy", self.global_steps)
+
+                    # ===== Phase 3: training =====
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_start("training", iteration=self.global_steps)
+
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1238,6 +1285,12 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    # End Phase 3: training
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_end("training")
+                        self.phase_profiler.log_timings(timing_raw, "training", self.global_steps)
+
 
                 # validate
                 if (

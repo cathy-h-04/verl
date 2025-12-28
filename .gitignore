@@ -9,6 +9,14 @@
 **/playground
 **/wandb
 
+verl-env/
+outputs
+logs
+analysis_output
+per_phase_analysis
+per_subphase_analysis*
+monitoring/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
