@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -1006,6 +1007,17 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        # Persist resolved config once for downstream analysis.
+        try:
+            root_path = os.path.expanduser(os.getenv("VERL_FILE_LOGGER_ROOT", "."))
+            run_dir = os.path.join(root_path, self.config.trainer.project_name)
+            os.makedirs(run_dir, exist_ok=True)
+            config_path = os.path.join(run_dir, f"{self.config.trainer.experiment_name}_config.json")
+            if not os.path.exists(config_path):
+                with open(config_path, "w") as fp:
+                    json.dump(OmegaConf.to_container(self.config, resolve=True), fp, indent=2)
+        except Exception as e:
+            print(f"Warning: failed to dump config: {e}")
 
         self.global_steps = 0
 
@@ -1020,7 +1032,9 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            val_payload = {f"val/{k}": v for k, v in val_metrics.items()}
+            val_payload["logging/wall_time"] = time.time()
+            logger.log(data=val_payload, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1359,6 +1373,12 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
+
+                # Add logging metadata for downstream alignment/analysis.
+                metrics["logging/wall_time"] = time.time()
+                if self.phase_profiler:
+                    metrics["logging/phase"] = getattr(self.phase_profiler, "current_phase", None)
+                    metrics["logging/granularity"] = getattr(self.phase_profiler, "granularity", None)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

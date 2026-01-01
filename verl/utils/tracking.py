@@ -23,6 +23,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
+
 
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
@@ -239,8 +242,22 @@ class FileLogger:
         self.fp = open(self.filepath, "w")
 
     def log(self, data, step):
-        data = {"step": step, "data": data}
-        self.fp.write(json.dumps(data) + "\n")
+        def _to_json_safe(obj):
+            # Convert common tensor/ndarray types to plain Python for JSON serialization.
+            if isinstance(obj, torch.Tensor):
+                return obj.item() if obj.numel() == 1 else obj.tolist()
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (dict, list, tuple)):
+                return obj.__class__([_to_json_safe(x) for x in obj]) if not isinstance(obj, dict) else {
+                    k: _to_json_safe(v) for k, v in obj.items()
+                }
+            return obj
+
+        safe_data = {"step": step, "data": _to_json_safe(data)}
+        self.fp.write(json.dumps(safe_data) + "\n")
 
     def finish(self):
         self.fp.close()

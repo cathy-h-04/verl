@@ -32,13 +32,12 @@ source verl-env/bin/activate
 
 export PYTHONPATH="${PYTHONPATH:-}:${PROJECT_DIR}/verl"
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
-export PYTHONPATH="${PYTHONPATH:-}:${PROJECT_DIR}/verl"
 export PYTHONUNBUFFERED=1
+# Structured file logging (JSONL) goes to monitoring/<project>/<experiment>.jsonl
+export VERL_FILE_LOGGER_ROOT="${PROJECT_DIR}/monitoring"
 
-# Flash safety (defensive)
-export HF_DISABLE_FLASH_ATTENTION=1
-export DISABLE_FLASH_ATTN=1
-export VLLM_DISABLE_FLASHINFER=1
+# Flash attention enabled (requires compatible flash-attn install)
+# export VLLM_DISABLE_FLASHINFER=1  # uncomment if flashinfer causes issues
 
 # -------------------- Directory Setup --------------------
 DATA_DIR="${PROJECT_DIR}/data/gsm8k"
@@ -64,18 +63,13 @@ echo "Verl Version: $(python -c 'import verl; print(verl.__version__)' 2>/dev/nu
 echo "========================================"
 echo ""
 
-if python -c "import flash_attn" 2>/dev/null; then
-    echo "WARNING: flash_attn is installed and may cause issues"
-    echo "Consider running: pip uninstall flash-attn -y"
-fi
-
 # -------------------- Data Preparation --------------------
 if [ ! -f "${DATA_DIR}/train.parquet" ] || [ ! -f "${DATA_DIR}/test.parquet" ]; then
     echo "Preparing GSM8K dataset..."
     python3 examples/data_preprocess/gsm8k.py --local_save_dir "$DATA_DIR"
-    echo "âœ“ Dataset prepared"
+    echo "Dataset prepared"
 else
-    echo "âœ“ Dataset already exists"
+    echo "Dataset already exists"
 fi
 echo ""
 
@@ -100,7 +94,11 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
   actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.mode=sync \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
+  actor_rollout_ref.rollout.max_num_batched_tokens=4096 \
+  actor_rollout_ref.rollout.enable_chunked_prefill=False \
+  actor_rollout_ref.rollout.max_model_len=1536 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTIL \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
@@ -108,21 +106,19 @@ python3 -m verl.trainer.main_ppo \
   critic.optim.lr=1e-5 \
   critic.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
   algorithm.kl_ctrl.kl_coef=0.001 \
-  trainer.logger=console \
+  trainer.logger=[console,file] \
   trainer.project_name="$EXPERIMENT_NAME" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   +trainer.enable_phase_profiling=True \
   +trainer.phase_profiling_granularity="$GRANULARITY" \
-  trainer.val_before_train=False \
   trainer.n_gpus_per_node=1 \
   trainer.nnodes=1 \
   trainer.save_freq=-1 \
-  trainer.test_freq=-1 \
   trainer.total_epochs=$TOTAL_EPOCHS \
   trainer.default_hdfs_dir=null \
   trainer.default_local_dir="$OUTPUT_DIR" \
-  +critic.model.override_config.attn_implementation=sdpa \
-  +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
+  +critic.model.override_config.attn_implementation=flash_attention_2 \
+  +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
   2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=$?
