@@ -10,6 +10,7 @@ BASE_EXPERIMENT_NAME="${1:-gsm8k_phased}"
 EPOCHS="${2:-1}"
 GPU_ID="${3:-1}"
 POLL_INTERVAL="${4:-1}"
+GRANULARITY="${5:-phase}"  # 'phase' or 'operation'
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -33,6 +34,7 @@ echo "Epochs: $EPOCHS"
 echo "GPU: $GPU_ID"
 echo "Poll Interval: ${POLL_INTERVAL}s"
 echo "Monitoring Dir: $MONITORING_DIR"
+echo "Granularity: $GRANULARITY (phase | operation for subphase timings)"
 echo "=========================================="
 
 # -------------------- Cleanup --------------------
@@ -79,7 +81,8 @@ echo ""
 bash "${PROFILING_DIR}/run_verl_gsm8k_light.sh" \
     "$EXPERIMENT_NAME" \
     "$EPOCHS" \
-    "$GPU_ID"
+    "$GPU_ID" \
+    "$GRANULARITY"
 
 echo ""
 echo "Training complete."

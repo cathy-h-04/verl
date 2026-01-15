@@ -14,10 +14,12 @@ GPU_ID="${3:-1}"
 POLL_INTERVAL="${4:-1}"
 GRANULARITY="${5:-operation}"  # 'phase' or 'operation'
 
-PROJECT_DIR="/home/cathxhou/projects/thesis_research/verl_research"
+PROJECT_DIR="/home/cathxhou/projects/verl_research"
+MONITORING_DIR="${PROJECT_DIR}/monitoring"
 cd "$PROJECT_DIR"
 
-mkdir -p monitoring
+mkdir -p "$MONITORING_DIR"
+export EXPERIMENT_NAME
 
 echo "=========================================="
 echo "verl Sub-Phase Level Profiling"
@@ -50,7 +52,7 @@ cleanup() {
     fi
     
     # Clean up phase state file (timing log is kept as valuable data)
-    rm -f monitoring/phase_state_${EXPERIMENT_NAME}*.json
+    rm -f "${MONITORING_DIR}/phase_state_${EXPERIMENT_NAME}"*.json
     
     echo "Done!"
     echo ""
@@ -59,15 +61,15 @@ cleanup() {
     echo "=========================================="
     
     # Find the actual generated files (with timestamp)
-    CSV_FILE=$(ls -t monitoring/${EXPERIMENT_NAME}*_phased.csv 2>/dev/null | head -1)
+    CSV_FILE=$(ls -t "${MONITORING_DIR}/${EXPERIMENT_NAME}"*_phased.csv 2>/dev/null | head -1)
     if [ -n "$CSV_FILE" ]; then
         echo "GPU Metrics CSV: $CSV_FILE"
     else
-        echo "GPU Metrics CSV: monitoring/${EXPERIMENT_NAME}*_phased.csv (not found)"
+        echo "GPU Metrics CSV: ${MONITORING_DIR}/${EXPERIMENT_NAME}*_phased.csv (not found)"
     fi
     
     if [ "$GRANULARITY" = "operation" ]; then
-        TIMING_FILE=$(ls -t monitoring/phase_timings_${EXPERIMENT_NAME}*.jsonl 2>/dev/null | head -1)
+        TIMING_FILE=$(ls -t "${MONITORING_DIR}/phase_timings_${EXPERIMENT_NAME}"*.jsonl 2>/dev/null | head -1)
         if [ -n "$TIMING_FILE" ]; then
             echo "Timing Log: $TIMING_FILE"
             echo ""
@@ -76,7 +78,7 @@ cleanup() {
             echo "    --gpu-csv $CSV_FILE \\"
             echo "    --timing-log $TIMING_FILE"
         else
-            echo "Timing Log: monitoring/phase_timings_${EXPERIMENT_NAME}*.jsonl (not found)"
+            echo "Timing Log: ${MONITORING_DIR}/phase_timings_${EXPERIMENT_NAME}*.jsonl (not found)"
         fi
     else
         echo ""
@@ -93,19 +95,20 @@ trap cleanup EXIT INT TERM
 echo "Starting GPU monitor (will auto-detect timestamped experiment name)..."
 
 # Start a wrapper script that monitors for the phase state file
-cat > monitoring/monitor_wrapper_${EXPERIMENT_NAME}.sh << 'EOF_WRAPPER'
+cat > "${MONITORING_DIR}/monitor_wrapper_${EXPERIMENT_NAME}.sh" << EOF_WRAPPER
 #!/bin/bash
 EXPERIMENT_BASE="$1"
 GPU_ID="$2"
 POLL_INTERVAL="$3"
 MONITOR_SCRIPT="$4"
+MONITORING_DIR="${MONITORING_DIR}"
 
 # Wait for phase state file to appear (with any timestamp)
 echo "Waiting for phase state file to appear..."
 MAX_WAIT=60
 WAIT_COUNT=0
 while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-    STATE_FILE=$(ls -t /home/cathxhou/projects/thesis_research/verl_research/monitoring/phase_state_${EXPERIMENT_BASE}*.json 2>/dev/null | head -1)
+    STATE_FILE=$(ls -t "${MONITORING_DIR}/phase_state_${EXPERIMENT_BASE}"*.json 2>/dev/null | head -1)
     if [ -n "$STATE_FILE" ]; then
         # Extract the full experiment name from the file
         FULL_EXP_NAME=$(basename "$STATE_FILE" | sed 's/phase_state_//' | sed 's/.json$//')
@@ -120,9 +123,9 @@ echo "ERROR: Timeout waiting for phase state file"
 exit 1
 EOF_WRAPPER
 
-chmod +x monitoring/monitor_wrapper_${EXPERIMENT_NAME}.sh
+chmod +x "${MONITORING_DIR}/monitor_wrapper_${EXPERIMENT_NAME}.sh"
 
-./monitoring/monitor_wrapper_${EXPERIMENT_NAME}.sh \
+"${MONITORING_DIR}/monitor_wrapper_${EXPERIMENT_NAME}.sh" \
   "$EXPERIMENT_NAME" \
   "$GPU_ID" \
   "$POLL_INTERVAL" \

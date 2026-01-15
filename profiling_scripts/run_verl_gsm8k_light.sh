@@ -13,6 +13,7 @@ MODEL_NAME="Qwen/Qwen2.5-0.5B-Instruct"
 TOTAL_EPOCHS="${2:-1}"
 GPU_ID="${3:-1}"
 GRANULARITY="${4:-phase}"  # 'phase' or 'operation'
+export EXPERIMENT_NAME
 
 # Batch size configuration - SMALL for fast profiling
 TRAIN_BATCH_SIZE=16
