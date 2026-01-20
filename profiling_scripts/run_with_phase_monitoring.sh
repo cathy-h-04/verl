@@ -8,9 +8,14 @@ set -e
 # -------------------- Arguments --------------------
 BASE_EXPERIMENT_NAME="${1:-gsm8k_phased}"
 EPOCHS="${2:-1}"
-GPU_ID="${3:-1}"
-POLL_INTERVAL="${4:-1}"
-GRANULARITY="${5:-phase}"  # 'phase' or 'operation'
+POLL_INTERVAL="${3:-1}"
+GRANULARITY="${4:-phase}"  # 'phase' or 'operation'
+MODEL_NAME="${5:-Qwen/Qwen2.5-0.5B-Instruct}"
+POLICY="${6:-ppo}"  # ppo | remax
+NNODES="${7:-1}"
+N_GPUS_PER_NODE="${8:-1}"
+DATASET_NAME="${9:-gsm8k}"
+GPU_ID=0
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -20,6 +25,9 @@ EXPERIMENT_NAME="${BASE_EXPERIMENT_NAME}_${TIMESTAMP}"
 PROJECT_DIR="/home/cathxhou/projects/verl_research"
 PROFILING_DIR="${PROJECT_DIR}/profiling_scripts"
 MONITORING_DIR="${PROJECT_DIR}/monitoring"
+if [ "${USE_VALIDATION:-0}" = "1" ]; then
+    MONITORING_DIR="${PROJECT_DIR}/monitoring_val"
+fi
 
 mkdir -p "$MONITORING_DIR"
 cd "$PROJECT_DIR"
@@ -27,7 +35,7 @@ cd "$PROJECT_DIR"
 export EXPERIMENT_NAME
 
 echo "=========================================="
-echo "verl Phase-Level Profiling (FIXED)"
+echo "verl Phase/Subphase Profiling"
 echo "=========================================="
 echo "Experiment (canonical): $EXPERIMENT_NAME"
 echo "Epochs: $EPOCHS"
@@ -35,6 +43,10 @@ echo "GPU: $GPU_ID"
 echo "Poll Interval: ${POLL_INTERVAL}s"
 echo "Monitoring Dir: $MONITORING_DIR"
 echo "Granularity: $GRANULARITY (phase | operation for subphase timings)"
+echo "Model: $MODEL_NAME"
+echo "Policy: $POLICY"
+echo "Nodes: $NNODES (gpus per node: $N_GPUS_PER_NODE)"
+echo "Dataset: $DATASET_NAME"
 echo "=========================================="
 
 # -------------------- Cleanup --------------------
@@ -59,10 +71,12 @@ trap cleanup EXIT INT TERM
 # -------------------- Start GPU Monitor --------------------
 echo "Starting GPU monitor..."
 
-bash "${PROFILING_DIR}/monitor_nvidia_smi_phased.sh" \
+MONITORING_DIR="$MONITORING_DIR" bash "${PROFILING_DIR}/monitor_nvidia_smi_phased.sh" \
     "$EXPERIMENT_NAME" \
     "$GPU_ID" \
-    "$POLL_INTERVAL" &
+    "$POLL_INTERVAL" \
+    "$NNODES" \
+    "$N_GPUS_PER_NODE" &
 
 MONITOR_PID=$!
 echo "Monitor started (PID: $MONITOR_PID)"
@@ -78,11 +92,18 @@ echo ""
 echo "Starting training..."
 echo ""
 
-bash "${PROFILING_DIR}/run_verl_gsm8k_light.sh" \
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-run_verl_train_nonval.sh}"
+
+bash "${PROFILING_DIR}/${TRAIN_SCRIPT}" \
     "$EXPERIMENT_NAME" \
     "$EPOCHS" \
     "$GPU_ID" \
-    "$GRANULARITY"
+    "$GRANULARITY" \
+    "$MODEL_NAME" \
+    "$POLICY" \
+    "$NNODES" \
+    "$N_GPUS_PER_NODE" \
+    "$DATASET_NAME"
 
 echo ""
 echo "Training complete."

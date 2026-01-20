@@ -3,17 +3,19 @@
 # monitor_nvidia_smi_phased.sh
 # Enhanced GPU monitoring with phase tracking
 #
-# Usage: ./monitor_nvidia_smi_phased.sh <experiment_name> <gpu_id> <poll_interval_seconds>
+# Usage: ./monitor_nvidia_smi_phased.sh <experiment_name> <gpu_id> <poll_interval_seconds> [nnodes] [gpus_per_node]
 
 set -e
 
 EXPERIMENT_NAME="${1:-default_experiment}"
 GPU_ID="${2:-0}"
 POLL_INTERVAL="${3:-1}"
+NNODES="${4:-na}"
+N_GPUS_PER_NODE="${5:-na}"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 PROJECT_DIR="/home/cathxhou/projects/verl_research"
-MONITOR_DIR="$PROJECT_DIR/monitoring"
+MONITOR_DIR="${MONITORING_DIR:-$PROJECT_DIR/monitoring}"
 mkdir -p "$MONITOR_DIR"
 OUTPUT_FILE="$MONITOR_DIR/${EXPERIMENT_NAME}_phased_${TIMESTAMP}.csv"
 
@@ -48,11 +50,12 @@ echo "=== Phase-Aware GPU Monitor Started ==="
 echo "Experiment: $EXPERIMENT_NAME"
 echo "GPU ID: $GPU_ID"
 echo "Poll Interval: ${POLL_INTERVAL}s"
+echo "Nodes: $NNODES (gpus per node: $N_GPUS_PER_NODE)"
 echo "Output: $OUTPUT_FILE"
 echo "=========================================="
 
 # Write CSV header
-echo "timestamp,elapsed_seconds,phase_id,phase_name,iteration,gpu_id,gpu_name,temperature_c,power_draw_w,power_limit_w,memory_used_mb,memory_total_mb,memory_util_percent,gpu_util_percent,sm_clock_mhz,mem_clock_mhz" > "$OUTPUT_FILE"
+echo "timestamp,elapsed_seconds,phase_id,phase_name,iteration,nnodes,gpus_per_node,gpu_id,gpu_name,temperature_c,power_draw_w,power_limit_w,memory_used_mb,memory_total_mb,memory_util_percent,gpu_util_percent,sm_clock_mhz,mem_clock_mhz" > "$OUTPUT_FILE"
 
 START_TIME=$(date +%s)
 
@@ -88,7 +91,7 @@ while true; do
     mem_clock=$(echo "$mem_clock" | xargs)
     
     # Write to CSV
-    echo "$TIMESTAMP,$ELAPSED,$PHASE_ID,$PHASE_NAME,$ITERATION,$GPU_ID,$gpu_name,$temp,$power_draw,$power_limit,$mem_used,$mem_total,$mem_util,$gpu_util,$sm_clock,$mem_clock" >> "$OUTPUT_FILE"
+    echo "$TIMESTAMP,$ELAPSED,$PHASE_ID,$PHASE_NAME,$ITERATION,$NNODES,$N_GPUS_PER_NODE,$GPU_ID,$gpu_name,$temp,$power_draw,$power_limit,$mem_used,$mem_total,$mem_util,$gpu_util,$sm_clock,$mem_clock" >> "$OUTPUT_FILE"
     
     sleep "$POLL_INTERVAL"
 done
