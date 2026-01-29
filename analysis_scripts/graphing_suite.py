@@ -15,6 +15,7 @@ This script intentionally focuses on maintainable structure over cleverness.
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -23,6 +24,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 # The sandbox may not have them installed, so runtime verification might not
 # be possible here.
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
 
@@ -68,6 +70,29 @@ EXCLUDED_OPERATIONS = {
     "generation_timing/min",
     "generation_timing/topk_ratio",
     "step",
+}
+
+PHASE_OPERATION_ORDER: Dict[str, List[str]] = {
+    "rollout": [
+        "start_profile",
+        "generate_sequences",
+        "generation_timing/max",
+        "generation_timing/min",
+        "generation_timing/topk_ratio",
+        "gen",
+        "gen_max",
+    ],
+    "rl_policy": [
+        "reward",
+        "old_log_prob",
+        "Role.RefPolicy",
+        "values",
+        "adv",
+    ],
+    "training": [
+        "update_critic",
+        "update_actor",
+    ],
 }
 
 # -----------------------------
@@ -123,6 +148,11 @@ def apply_theme(theme: ThemeConfig) -> None:
         sns.set_theme(context=theme.context, style="whitegrid", palette=theme.palette)
 
     plt.rcParams.update(dict(theme.rc_params))
+
+
+def format_title(run_name: str, title: str) -> Tuple[str, str]:
+    """Return (suptitle, title) with experiment name above metric title."""
+    return run_name, title
 
 
 # -----------------------------
@@ -206,6 +236,21 @@ def load_merged_sweep_csv(path: Optional[Path]) -> Optional[pd.DataFrame]:
     if "step" in df.columns:
         df["step"] = pd.to_numeric(df["step"], errors="coerce")
     return df
+
+
+def load_cleaned_phase_timings_df(path: Optional[Path]) -> Optional[pd.DataFrame]:
+    if path is None or not path.exists():
+        return None
+    records: List[Dict[str, object]] = []
+    with path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    if not records:
+        return None
+    return pd.DataFrame(records)
 
 
 # -----------------------------
@@ -329,6 +374,7 @@ class BasePlotter:
     """
 
     plot_name: str = "base"
+    plot_title: str = "Plot"
 
     def __init__(
         self,
@@ -344,6 +390,7 @@ class BasePlotter:
         # Load data once per plotter instance.
         self.annotated_df = add_gpu_derived_columns(load_annotated_csv(run_paths.annotated_csv))
         self.merged_df = load_merged_sweep_csv(run_paths.merged_sweep_csv)
+        self.timings_df = load_cleaned_phase_timings_df(run_paths.cleaned_phase_timings)
 
     # ---- hooks for subclasses ----
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
@@ -367,7 +414,7 @@ class BasePlotter:
 
     # ---- orchestration ----
     def output_path(self) -> Path:
-        filename = f"{self.run_paths.run_name}_{self.plot_name}.png"
+        filename = f"{self.plot_name}_{self.run_paths.run_name}.png"
         return self.output_dir / filename
 
     def render(self) -> Path:
@@ -392,10 +439,12 @@ class GPUOverviewPlotter(BasePlotter):
     """Overview grid for key GPU telemetry metrics."""
 
     plot_name = "gpu_overview"
+    plot_title = "GPU Overview"
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
         fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-        fig.suptitle(f"GPU Overview: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "GPU Overview")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -476,6 +525,7 @@ class PhaseTimelinePlotter(BasePlotter):
     """Time series with phase shading, using annotated telemetry."""
 
     plot_name = "phase_timeline"
+    plot_title = "Phase Timeline"
 
     metric_columns: Sequence[Tuple[str, str]] = (
         ("gpu_util_percent", "GPU Utilization (%)"),
@@ -487,7 +537,8 @@ class PhaseTimelinePlotter(BasePlotter):
         fig, axes = plt.subplots(n, 1, figsize=(14, 4.5 * n), sharex=True)
         if n == 1:
             axes = np.asarray([axes])
-        fig.suptitle(f"Phase Timeline: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Phase Timeline")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -517,7 +568,9 @@ class PhaseTimelinePlotter(BasePlotter):
 
             y = pd.to_numeric(df[metric], errors="coerce")
             ax.plot(x_rel_min, y, linewidth=1.0, color="#2c3e50", alpha=0.9)
+            ax.set_title(ylabel)
             ax.set_ylabel(ylabel)
+            ax.set_title(ylabel)
             ax.grid(True, alpha=self.theme.grid_alpha)
 
             # Shade phases behind the metric
@@ -551,10 +604,11 @@ class SweepMetricsPlotter(BasePlotter):
     """Stepwise training + validation metrics from merged sweep CSV."""
 
     plot_name = "sweep_metrics"
+    plot_title = "Sweep Metrics"
 
     # (column, label)
     sweep_metrics: Sequence[Tuple[str, str]] = (
-        ("data.val-core/openai/gsm8k/reward/mean@1", "Validation Reward@1"),
+        ("data.val-core/openai/gsm8k/reward/mean@1", "Reward"),
         ("data.perf/throughput", "Throughput (tokens/s)"),
         ("data.perf/time_per_step", "Time Per Step (s)"),
     )
@@ -563,7 +617,8 @@ class SweepMetricsPlotter(BasePlotter):
         fig, axes = plt.subplots(len(self.sweep_metrics), 1, figsize=(12, 4.0 * len(self.sweep_metrics)), sharex=True)
         if len(self.sweep_metrics) == 1:
             axes = np.asarray([axes])
-        fig.suptitle(f"Sweep Metrics: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Sweep Metrics")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -588,6 +643,7 @@ class SweepMetricsPlotter(BasePlotter):
 
             y = pd.to_numeric(df[col], errors="coerce")
             ax.plot(x, y, linewidth=1.2, alpha=0.9, color="#34495e")
+            ax.set_title(label)
             ax.set_ylabel(label)
             ax.grid(True, alpha=self.theme.grid_alpha)
 
@@ -598,6 +654,7 @@ class OperationAggregatePlotter(BasePlotter):
     """Aggregate GPU behavior by operation using annotated telemetry."""
 
     plot_name = "operation_aggregate"
+    plot_title = "Operation Aggregate"
 
     metrics: Sequence[Tuple[str, str]] = (
         ("avg_power_w", "Average Power (W)"),
@@ -638,6 +695,7 @@ class OperationComparisonPlotter(BasePlotter):
     """Boxplot comparison of GPU metrics by operation (annotated CSV)."""
 
     plot_name = "operation_comparison"
+    plot_title = "Operation Metric Comparison"
 
     metrics: Sequence[Tuple[str, str]] = (
         ("power_draw_w", "Power (W)"),
@@ -649,7 +707,8 @@ class OperationComparisonPlotter(BasePlotter):
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle(f"Operation Metric Comparison: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Operation Metric Comparison")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -691,6 +750,7 @@ class OperationComparisonPlotter(BasePlotter):
             )
             ax.set_xlabel("")
             ax.set_ylabel(label)
+            ax.set_title(label)
             ax.grid(True, axis="y", alpha=self.theme.grid_alpha)
             ax.tick_params(axis="x", labelrotation=45)
             for label_text in ax.get_xticklabels():
@@ -706,6 +766,7 @@ class SmoothedTimeSeriesPlotter(BasePlotter):
     """Smoothed time series for key GPU metrics."""
 
     plot_name = "smoothed_timeseries"
+    plot_title = "Smoothed Time Series"
 
     metrics: Sequence[Tuple[str, str]] = (
         ("gpu_util_percent", "GPU Utilization (%)"),
@@ -717,7 +778,8 @@ class SmoothedTimeSeriesPlotter(BasePlotter):
         fig, axes = plt.subplots(len(self.metrics), 1, figsize=(14, 4.0 * len(self.metrics)), sharex=True)
         if len(self.metrics) == 1:
             axes = np.asarray([axes])
-        fig.suptitle(f"Smoothed Time Series: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Smoothed Time Series")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -732,6 +794,7 @@ class SmoothedTimeSeriesPlotter(BasePlotter):
             series = pd.to_numeric(df[metric], errors="coerce")
             smooth = series.rolling(window=window, min_periods=max(1, window // 3)).mean()
             ax.plot(time_min, smooth, linewidth=1.2, color="#34495e")
+            ax.set_title(label)
             ax.set_ylabel(label)
             ax.grid(True, alpha=self.theme.grid_alpha)
 
@@ -742,10 +805,12 @@ class PhaseAggregatePlotter(BasePlotter):
     """Aggregate GPU metrics per phase, similar to old phase comparison plots."""
 
     plot_name = "phase_aggregate"
+    plot_title = "Phase Aggregates"
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
         fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-        fig.suptitle(f"Phase Aggregates: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Phase Aggregates")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -797,6 +862,7 @@ class PhaseFocusMetricsPlotter(BasePlotter):
     """Per-iteration plots grouped by phase (3 panels: util, power, temp)."""
 
     plot_name = "phase_focus"
+    plot_title = "Iteration Focus"
     focus_phase: str = "rollout"
     focus_window: Tuple[int, int] = (225, 235)
     use_time_axis: bool = True
@@ -809,11 +875,8 @@ class PhaseFocusMetricsPlotter(BasePlotter):
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
         fig, axes = plt.subplots(len(self.metrics), 1, figsize=(14, 12), sharex=True)
-        fig.suptitle(
-            f"Iteration Focus: {self.focus_phase} ({self.run_paths.run_name})",
-            fontsize=14,
-            fontweight="bold",
-        )
+        suptitle, title = format_title(self.run_paths.run_name, f"Iteration Focus: {self.focus_phase}")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, np.asarray(axes)
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -905,10 +968,12 @@ class PhaseEnergyTimeStackedPlotter(BasePlotter):
     """Energy and time distribution across phases (100% stacked bars)."""
 
     plot_name = "phase_energy_time_stacked"
+    plot_title = "Energy and Time Distribution"
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
         fig, axes = plt.subplots(1, 1, figsize=(10, 6))
-        fig.suptitle(f"Energy and Time Distribution: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Energy and Time Distribution")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, np.asarray([axes])
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -978,6 +1043,7 @@ class PhaseBoxplotPlotter(BasePlotter):
     """Phase-level metric comparison (box plots) across 5 metrics."""
 
     plot_name = "phase_boxplots"
+    plot_title = "Phase Metric Comparison"
 
     metrics: Sequence[Tuple[str, str]] = (
         ("gpu_util_percent", "GPU Util (%)"),
@@ -989,7 +1055,8 @@ class PhaseBoxplotPlotter(BasePlotter):
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle(f"Phase Metric Comparison: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Phase Metric Comparison")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -1031,6 +1098,7 @@ class PhaseBoxplotPlotter(BasePlotter):
             )
             ax.set_xlabel("")
             ax.set_ylabel(label)
+            ax.set_title(label)
             ax.tick_params(axis="x", labelrotation=15)
             for label_text in ax.get_xticklabels():
                 label_text.set_ha("right")
@@ -1040,10 +1108,613 @@ class PhaseBoxplotPlotter(BasePlotter):
             ax.set_visible(False)
 
 
+class ThermalSteadyStatePlotter(BasePlotter):
+    """Temperature over time for the full run (thermal stability check)."""
+
+    plot_name = "thermal_steady_state"
+    plot_title = "Thermal Steady-State"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(12, 5))
+        suptitle, title = format_title(self.run_paths.run_name, "Thermal Steady-State")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        df = self.annotated_df
+        ax = axes[0]
+        if "temperature_c" not in df.columns:
+            ax.set_title("Missing temperature_c")
+            return
+        ax.plot(df["elapsed_minutes"], pd.to_numeric(df["temperature_c"], errors="coerce"), color="#f39c12", linewidth=1.2)
+        ax.set_xlabel("Time (minutes)")
+        ax.set_ylabel("Temperature (°C)")
+        ax.set_title("Thermal Steady-State")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+
+class PhaseComputeDensityPlotter(BasePlotter):
+    """Utilization vs power draw, colored by phase."""
+
+    plot_name = "phase_compute_density"
+    plot_title = "Phase Compute Density"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+        suptitle, title = format_title(self.run_paths.run_name, "Phase Compute Density")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        df = self.annotated_df.copy()
+        df = df[df["phase_name"] != "idle"]
+        ax = axes[0]
+        if df.empty:
+            ax.set_title("No non-idle phase data.")
+            return
+        if sns is not None:
+            sns.scatterplot(
+                data=df,
+                x="gpu_util_percent",
+                y="power_draw_w",
+                hue="phase_name",
+                palette=PHASE_COLORS,
+                alpha=0.6,
+                s=12,
+                ax=ax,
+                legend=True,
+            )
+        else:
+            for phase in df["phase_name"].unique():
+                phase_df = df[df["phase_name"] == phase]
+                ax.scatter(
+                    phase_df["gpu_util_percent"],
+                    phase_df["power_draw_w"],
+                    s=12,
+                    alpha=0.6,
+                    color=PHASE_COLORS.get(phase, PHASE_COLORS["unknown"]),
+                    label=phase,
+                )
+            ax.legend(loc="upper right")
+        # Centroid + 1-sigma ellipse per phase
+        for phase in sorted(df["phase_name"].unique()):
+            phase_df = df[df["phase_name"] == phase]
+            x = pd.to_numeric(phase_df["gpu_util_percent"], errors="coerce")
+            y = pd.to_numeric(phase_df["power_draw_w"], errors="coerce")
+            mask = x.notna() & y.notna()
+            x = x[mask]
+            y = y[mask]
+            if len(x) < 2:
+                continue
+            mean_x = x.mean()
+            mean_y = y.mean()
+            cov = np.cov(x, y)
+            vals, vecs = np.linalg.eigh(cov)
+            order = vals.argsort()[::-1]
+            vals = vals[order]
+            vecs = vecs[:, order]
+            width, height = 2 * np.sqrt(vals)
+            angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+            color = PHASE_COLORS.get(phase, PHASE_COLORS["unknown"])
+            ellipse = Ellipse(
+                (mean_x, mean_y),
+                width=width,
+                height=height,
+                angle=angle,
+                edgecolor=color,
+                facecolor="none",
+                linewidth=1.5,
+                alpha=0.9,
+            )
+            ax.add_patch(ellipse)
+            ax.scatter([mean_x], [mean_y], color=color, s=60, marker="X", edgecolor="black", linewidth=0.5)
+        ax.set_xlabel("GPU Utilization (%)")
+        ax.set_ylabel("Power Draw (W)")
+        ax.set_title("Phase Compute Density")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+
+class OrchestrationTaxPlotter(BasePlotter):
+    """Gap analysis between phase timing records (orchestration tax)."""
+
+    plot_name = "orchestration_tax"
+    plot_title = "Orchestration Tax (Gaps)"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(10, 5))
+        suptitle, title = format_title(self.run_paths.run_name, "Orchestration Tax (Gaps)")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.timings_df is None or self.timings_df.empty:
+            ax.set_title("Missing cleaned_phase_timings data.")
+            return
+
+        df = self.timings_df.copy()
+        df = df.sort_values(["iteration", "timestamp"])
+
+        op_cols = [c for c in df.columns if c not in {"iteration", "phase", "timestamp"}]
+        for col in op_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["phase_duration_s"] = df[op_cols].sum(axis=1, skipna=True)
+        df["phase_end_ts"] = pd.to_numeric(df["timestamp"], errors="coerce")
+        df["phase_start_ts"] = df["phase_end_ts"] - df["phase_duration_s"]
+
+        df = df.sort_values("phase_start_ts").reset_index(drop=True)
+        next_start = df["phase_start_ts"].iloc[1:].to_numpy()
+        current_end = df["phase_end_ts"].iloc[:-1].to_numpy()
+        gaps = next_start - current_end
+        gaps = gaps[gaps >= 0]
+
+        if len(gaps) == 0:
+            ax.set_title("No positive gaps found.")
+            return
+
+        x = np.arange(len(gaps))
+        ax.plot(x, gaps, color="#7f8c8d", linewidth=1.3, marker="o", markersize=3, alpha=0.9)
+        ax.set_xlabel("Transition Index")
+        ax.set_ylabel("Gap Duration (s)")
+        ax.set_title("Orchestration Tax (Gaps)")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+class HierarchicalWaterfallPlotter(BasePlotter):
+    """Single-iteration waterfall chart showing phase + subphase breakdown."""
+
+    plot_name = "hierarchical_waterfall"
+    plot_title = "Hierarchical Work Breakdown"
+    target_iteration: int = 230
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(12, 6))
+        suptitle, title = format_title(self.run_paths.run_name, "Hierarchical Work Breakdown")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.timings_df is None or self.timings_df.empty:
+            ax.set_title("Missing cleaned_phase_timings data.")
+            return
+
+        df = self.timings_df.copy()
+        df["iteration"] = pd.to_numeric(df["iteration"], errors="coerce")
+        df = df.dropna(subset=["iteration"])
+
+        target_iter = self.target_iteration
+        if target_iter not in df["iteration"].unique():
+            unique_iters = sorted(df["iteration"].unique())
+            if not unique_iters:
+                ax.set_title("No valid iterations found.")
+                return
+            target_iter = unique_iters[len(unique_iters) // 2]
+
+        df = df[df["iteration"] == target_iter]
+        if df.empty:
+            ax.set_title("No data for selected iteration.")
+            return
+
+        # Build ordered segments per phase
+        phase_segments: Dict[str, List[Tuple[str, float]]] = {}
+        phase_order = ["rollout", "rl_policy", "training"]
+        for phase in phase_order:
+            phase_row = df[df["phase"] == phase]
+            if phase_row.empty:
+                continue
+            row = phase_row.iloc[0].to_dict()
+            ops = {k: float(v) for k, v in row.items() if k not in {"iteration", "phase", "timestamp"} and isinstance(v, (int, float))}
+
+            ordered_ops = PHASE_OPERATION_ORDER.get(phase, [])
+            segments: List[Tuple[str, float]] = []
+            if ordered_ops:
+                for op in ordered_ops:
+                    if op in ops and op not in EXCLUDED_OPERATIONS:
+                        segments.append((op, ops[op]))
+            else:
+                for op, duration in sorted(ops.items()):
+                    if op in EXCLUDED_OPERATIONS:
+                        continue
+                    segments.append((op, duration))
+            if segments:
+                phase_segments[phase] = segments
+
+        if not phase_segments:
+            ax.set_title("No subphase durations available.")
+            return
+
+        y_ticks = []
+        y_labels = []
+        y_pos = 0
+        for phase in phase_order:
+            if phase not in phase_segments:
+                continue
+            start = 0.0
+            for op, duration in phase_segments[phase]:
+                color = PHASE_COLORS.get(phase, PHASE_COLORS["unknown"])
+                ax.barh(y_pos, duration, left=start, height=0.6, color=color, alpha=0.8, edgecolor="white")
+                if duration > 0:
+                    ax.text(start + duration / 2.0, y_pos, op, ha="center", va="center", fontsize=7, color="black")
+                start += duration
+            y_ticks.append(y_pos)
+            y_labels.append(phase)
+            y_pos += 1
+
+        ax.set_yticks(y_ticks)
+        ax.set_yticklabels(y_labels)
+        ax.set_xlabel("Time (s)")
+        ax.set_title(f"Iteration {int(target_iter)}")
+        ax.grid(True, axis="x", alpha=self.theme.grid_alpha)
+
+
+class MFUComparisonPlotter(BasePlotter):
+    """Actor vs critic MFU over step."""
+
+    plot_name = "mfu_comparison"
+    plot_title = "MFU Comparison"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(10, 5))
+        suptitle, title = format_title(self.run_paths.run_name, "MFU Comparison")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df
+        if "step" not in df.columns:
+            ax.set_title("Missing step column.")
+            return
+        x = pd.to_numeric(df["step"], errors="coerce")
+        for col, label, color in [
+            ("data.perf/mfu/actor", "Actor MFU", "#2980b9"),
+            ("data.perf/mfu/critic", "Critic MFU", "#8e44ad"),
+        ]:
+            if col not in df.columns:
+                continue
+            y = pd.to_numeric(df[col], errors="coerce")
+            ax.plot(x, y, label=label, linewidth=1.3, color=color)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("MFU")
+        ax.set_title("MFU Comparison")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
+class ThroughputVsLengthPlotter(BasePlotter):
+    """Throughput vs sequence length with regression line."""
+
+    plot_name = "throughput_vs_length"
+    plot_title = "Throughput vs Seq Length"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+        suptitle, title = format_title(self.run_paths.run_name, "Throughput vs Seq Length")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df
+        if "data.global_seqlen/mean" not in df.columns or "data.perf/throughput" not in df.columns:
+            ax.set_title("Missing required columns.")
+            return
+        x = pd.to_numeric(df["data.global_seqlen/mean"], errors="coerce")
+        y = pd.to_numeric(df["data.perf/throughput"], errors="coerce")
+        ax.scatter(x, y, s=20, alpha=0.6, color="#34495e")
+        # Simple regression line
+        mask = x.notna() & y.notna()
+        if mask.sum() >= 2:
+            coeffs = np.polyfit(x[mask], y[mask], 1)
+            line_x = np.linspace(x[mask].min(), x[mask].max(), 100)
+            line_y = coeffs[0] * line_x + coeffs[1]
+            ax.plot(line_x, line_y, color="#e74c3c", linewidth=1.5)
+        ax.set_xlabel("Mean Sequence Length")
+        ax.set_ylabel("Throughput (tokens/s)")
+        ax.set_title("Throughput vs Seq Length")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+
+class LearningPricePlotter(BasePlotter):
+    """Reward vs total tokens (learning efficiency)."""
+
+    plot_name = "learning_price"
+    plot_title = "Learning Price"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+        suptitle, title = format_title(self.run_paths.run_name, "Learning Price")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df
+        reward_col = "data.val-core/openai/gsm8k/reward/mean@1"
+        tokens_col = "data.perf/total_num_tokens"
+        if reward_col not in df.columns or tokens_col not in df.columns:
+            ax.set_title("Missing required columns.")
+            return
+        work = df.copy()
+        if "step" in work.columns:
+            work = work.sort_values("step")
+
+        tokens = pd.to_numeric(work[tokens_col], errors="coerce")
+        reward = pd.to_numeric(work[reward_col], errors="coerce")
+
+        # Determine whether tokens are cumulative; if not, derive cumulative tokens.
+        diffs = tokens.diff()
+        non_decreasing_ratio = (diffs.dropna() >= 0).mean() if diffs.notna().any() else 0.0
+        if non_decreasing_ratio >= 0.9:
+            tokens_cum = tokens
+        else:
+            # Fallback: approximate per-step tokens via throughput * time_per_step.
+            throughput = pd.to_numeric(work.get("data.perf/throughput"), errors="coerce")
+            time_per_step = pd.to_numeric(work.get("data.perf/time_per_step"), errors="coerce")
+            per_step_tokens = throughput * time_per_step
+            tokens_cum = per_step_tokens.fillna(0).cumsum()
+
+        mask = tokens_cum.notna() & reward.notna()
+        x = tokens_cum[mask]
+        y = reward[mask]
+        if x.empty or y.empty:
+            ax.set_title("Missing valid reward/token data.")
+            return
+        order = np.argsort(x.to_numpy())
+        x_sorted = x.to_numpy()[order]
+        y_sorted = y.to_numpy()[order]
+        ax.plot(x_sorted, y_sorted, color="#95a5a6", linewidth=0.8, alpha=0.6)
+        window = max(3, int(len(y_sorted) * 0.1))
+        if len(y_sorted) >= window:
+            y_smooth = pd.Series(y_sorted).rolling(window=window, min_periods=max(2, window // 3)).mean().to_numpy()
+            ax.plot(x_sorted, y_smooth, color="#2ecc71", linewidth=1.6)
+        ax.set_xlabel("Total Tokens")
+        ax.set_ylabel("Reward")
+        ax.set_title("Learning Price")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+        # Diagnostic: flag potential reward cratering at high token counts.
+        if len(y_sorted) >= max(10, window):
+            tail_len = max(10, int(len(y_sorted) * 0.15))
+            head_len = max(10, int(len(y_sorted) * 0.15))
+            head_mean = np.nanmean(y_sorted[:head_len])
+            tail_mean = np.nanmean(y_sorted[-tail_len:])
+            if np.isfinite(head_mean) and np.isfinite(tail_mean) and tail_mean < head_mean * 0.7:
+                ax.text(
+                    0.02,
+                    0.02,
+                    "Warning: Reward drops in tail; verify logging vs true divergence.",
+                    transform=ax.transAxes,
+                    fontsize=8,
+                    color="#c0392b",
+                )
+
+
+class MemoryOverheadPlotter(BasePlotter):
+    """Area plot showing reserved vs allocated memory gap."""
+
+    plot_name = "memory_overhead"
+    plot_title = "Memory Overhead"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+        suptitle, title = format_title(self.run_paths.run_name, "Memory Overhead")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df
+        alloc_col = "data.perf/max_memory_allocated_gb"
+        reserv_col = "data.perf/max_memory_reserved_gb"
+        if alloc_col not in df.columns or reserv_col not in df.columns:
+            ax.set_title("Missing required columns.")
+            return
+        x = pd.to_numeric(df.get("step"), errors="coerce") if "step" in df.columns else np.arange(len(df))
+        alloc = pd.to_numeric(df[alloc_col], errors="coerce")
+        reserv = pd.to_numeric(df[reserv_col], errors="coerce")
+        ax.fill_between(x, alloc, reserv, color="#e74c3c", alpha=0.35, label="Reserved - Allocated")
+        ax.plot(x, reserv, color="#c0392b", linewidth=1.0, label="Reserved")
+        ax.plot(x, alloc, color="#2980b9", linewidth=1.0, label="Allocated")
+        ax.set_xlabel("Step" if "step" in df.columns else "Index")
+        ax.set_ylabel("Memory (GB)")
+        ax.set_title("Memory Overhead")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
+class TokenBottlenecksPlotter(BasePlotter):
+    """Horizontal bar chart for per-token timing micro-bottlenecks."""
+
+    plot_name = "token_micro_bottlenecks"
+    plot_title = "Token Micro-bottlenecks"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(10, 6))
+        suptitle, title = format_title(self.run_paths.run_name, "Token Micro-bottlenecks")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df
+        timing_cols = [c for c in df.columns if c.startswith("data.timing_per_token_ms/")]
+        if not timing_cols:
+            ax.set_title("No per-token timing columns found.")
+            return
+        means = {col: pd.to_numeric(df[col], errors="coerce").mean() for col in timing_cols}
+        items = sorted(means.items(), key=lambda x: x[1], reverse=True)
+        labels = [k.split("/", 1)[-1] for k, _ in items]
+        values = [v for _, v in items]
+        ax.barh(labels, values, color="#7f8c8d", alpha=0.85)
+        ax.set_xlabel("Time per token (ms)")
+        ax.set_title("Token Micro-bottlenecks")
+        ax.invert_yaxis()
+        ax.grid(True, axis="x", alpha=self.theme.grid_alpha)
+
+
+class ThroughputRewardFrontierPlotter(BasePlotter):
+    """Scatter of reward vs throughput with temporal color gradient."""
+
+    plot_name = "throughput_reward_frontier"
+    plot_title = "Throughput-Reward Frontier"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df.copy()
+        reward_col = "data.val-core/openai/gsm8k/reward/mean@1"
+        thr_col = "data.perf/throughput"
+        if reward_col not in df.columns or thr_col not in df.columns:
+            ax.set_title("Missing required columns.")
+            return
+        if "step" in df.columns:
+            df = df.sort_values("step")
+            t = pd.to_numeric(df["step"], errors="coerce")
+        else:
+            t = pd.Series(np.arange(len(df)), index=df.index)
+        x = pd.to_numeric(df[reward_col], errors="coerce")
+        y = pd.to_numeric(df[thr_col], errors="coerce")
+        mask = x.notna() & y.notna() & t.notna()
+        x = x[mask]
+        y = y[mask]
+        t = t[mask]
+        sc = ax.scatter(x, y, c=t, cmap="viridis", s=25, alpha=0.8)
+        fig.colorbar(sc, ax=ax, label="Step")
+        ax.set_xlabel("Reward")
+        ax.set_ylabel("Throughput (tokens/s)")
+        ax.set_title(self.plot_title)
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+
+class HardwareROIPlotter(BasePlotter):
+    """Dual-axis line chart of MFU (actor/critic) vs rolling reward."""
+
+    plot_name = "hardware_roi"
+    plot_title = "Hardware ROI (MFU & Reward)"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(10, 5))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df.copy()
+        if "step" not in df.columns:
+            ax.set_title("Missing step column.")
+            return
+        df = df.sort_values("step")
+        x = pd.to_numeric(df["step"], errors="coerce")
+
+        mfu_actor = pd.to_numeric(df.get("data.perf/mfu/actor"), errors="coerce")
+        mfu_critic = pd.to_numeric(df.get("data.perf/mfu/critic"), errors="coerce")
+        reward = pd.to_numeric(df.get("data.val-core/openai/gsm8k/reward/mean@1"), errors="coerce")
+
+        ax.plot(x, mfu_actor, label="MFU Actor", color="#2980b9", linewidth=1.2)
+        ax.plot(x, mfu_critic, label="MFU Critic", color="#8e44ad", linewidth=1.2)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("MFU")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+        ax2 = ax.twinx()
+        reward_roll = reward.rolling(window=10, min_periods=3).mean()
+        ax2.plot(x, reward_roll, label="Reward (10-step mean)", color="#2ecc71", linewidth=1.5)
+        ax2.set_ylabel("Reward")
+
+        # Merge legends
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc="upper right")
+        ax.set_title(self.plot_title)
+
+
+class BottleneckEvolutionPlotter(BasePlotter):
+    """Compare per-token timings for early vs mature reward regimes."""
+
+    plot_name = "bottleneck_evolution"
+    plot_title = "Bottleneck Evolution"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(10, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df.copy()
+        reward_col = "data.val-core/openai/gsm8k/reward/mean@1"
+        if reward_col not in df.columns:
+            ax.set_title("Missing reward column.")
+            return
+        timing_cols = [c for c in df.columns if c.startswith("data.timing_per_token_ms/")]
+        if not timing_cols:
+            ax.set_title("No per-token timing columns found.")
+            return
+
+        reward = pd.to_numeric(df[reward_col], errors="coerce")
+        early_mask = reward < 0.1
+        mature_mask = reward > 0.4
+
+        if early_mask.sum() == 0 or mature_mask.sum() == 0:
+            ax.set_title("Insufficient early/mature reward samples.")
+            return
+
+        early_means = {col: pd.to_numeric(df.loc[early_mask, col], errors="coerce").mean() for col in timing_cols}
+        mature_means = {col: pd.to_numeric(df.loc[mature_mask, col], errors="coerce").mean() for col in timing_cols}
+
+        labels = [c.split("/", 1)[-1] for c in timing_cols]
+        early_vals = np.array([early_means[c] for c in timing_cols])
+        mature_vals = np.array([mature_means[c] for c in timing_cols])
+
+        y = np.arange(len(labels))
+        ax.barh(y - 0.2, early_vals, height=0.35, color="#95a5a6", label="Early (Reward < 0.1)")
+        ax.barh(y + 0.2, mature_vals, height=0.35, color="#2ecc71", label="Mature (Reward > 0.4)")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels)
+        ax.invert_yaxis()
+        ax.set_xlabel("Time per token (ms)")
+        ax.set_title(self.plot_title)
+        ax.grid(True, axis="x", alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
 class PhaseCorrelationPlotter(BasePlotter):
     """Correlation matrices per phase across 5 metrics."""
 
     plot_name = "phase_correlations"
+    plot_title = "Phase Correlations"
 
     metrics: Sequence[Tuple[str, str]] = (
         ("gpu_util_percent", "GPU Util (%)"),
@@ -1093,7 +1764,7 @@ class PhaseCorrelationPlotter(BasePlotter):
                 cbar_kws={"label": "Correlation"},
                 ax=ax,
             )
-            ax.set_title(f"Metric Correlations: {phase}", fontsize=12, fontweight="bold")
+            ax.set_title(f"Metric Correlations: {phase}")
             fig.tight_layout()
             save_path = out_dir / f"{self.run_paths.run_name}_corr_{phase}.png"
             fig.savefig(save_path, bbox_inches="tight", dpi=self.theme.save_dpi)
@@ -1106,7 +1777,8 @@ class PhaseCorrelationPlotter(BasePlotter):
         fig, axes = plt.subplots(1, len(self.metrics), figsize=(6.0 * len(self.metrics), 7))
         if len(self.metrics) == 1:
             axes = np.asarray([axes])
-        fig.suptitle(f"Operation Aggregate: {self.run_paths.run_name}", fontsize=14, fontweight="bold")
+        suptitle, title = format_title(self.run_paths.run_name, "Operation Aggregate")
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, np.asarray(axes)
 
     def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
@@ -1144,6 +1816,16 @@ PLOTTERS: Mapping[str, type[BasePlotter]] = {
     "phase_boxplots": PhaseBoxplotPlotter,
     "phase_correlations": PhaseCorrelationPlotter,
     "smoothed_timeseries": SmoothedTimeSeriesPlotter,
+    "thermal_steady_state": ThermalSteadyStatePlotter,
+    "phase_compute_density": PhaseComputeDensityPlotter,
+    "hierarchical_waterfall": HierarchicalWaterfallPlotter,
+    "mfu_comparison": MFUComparisonPlotter,
+    "throughput_vs_length": ThroughputVsLengthPlotter,
+    "throughput_reward_frontier": ThroughputRewardFrontierPlotter,
+    "hardware_roi": HardwareROIPlotter,
+    "learning_price": LearningPricePlotter,
+    "token_micro_bottlenecks": TokenBottlenecksPlotter,
+    "bottleneck_evolution": BottleneckEvolutionPlotter,
     "sweep_metrics": SweepMetricsPlotter,
     "operation_aggregate": OperationAggregatePlotter,
     "operation_comparison": OperationComparisonPlotter,
@@ -1186,7 +1868,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plots",
         type=str,
-        default="phase_focus_rollout,phase_focus_rl_policy,phase_focus_training,phase_energy_time_stacked,smoothed_timeseries,phase_boxplots,phase_correlations,phase_aggregate",
+        default="phase_focus_rollout,phase_focus_rl_policy,phase_focus_training,phase_energy_time_stacked,smoothed_timeseries,phase_boxplots,phase_correlations,phase_aggregate,thermal_steady_state,phase_compute_density,hierarchical_waterfall,mfu_comparison,throughput_vs_length,throughput_reward_frontier,hardware_roi,learning_price,token_micro_bottlenecks,bottleneck_evolution",
         help="Comma-separated list of plots to generate.",
     )
     parser.add_argument(
@@ -1202,8 +1884,11 @@ def main() -> None:
 
     if args.list_plots:
         print("Available plots:")
-        for name in sorted(PLOTTERS.keys()):
-            print(f"  - {name}")
+        default_plots = [p.strip() for p in str(parse_args().plots).split(",") if p.strip()]
+        for name in default_plots:
+            cls = PLOTTERS[name]
+            title = getattr(cls, "plot_title", "Plot")
+            print(f"  - {name}: {title}")
         return
 
     plot_names = [p.strip() for p in str(args.plots).split(",") if p.strip()]
