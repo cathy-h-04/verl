@@ -1,0 +1,1 @@
+"""Modular graphing suite package."""
