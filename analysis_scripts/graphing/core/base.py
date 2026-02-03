@@ -150,7 +150,8 @@ class BasePlotter:
         raise NotImplementedError
 
     def adjust_layout(self, fig, axes) -> None:
-        fig.tight_layout()
+        # Leave room for suptitles to avoid overlaps with subplot titles.
+        fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.93])
 
     def annotate(self, fig, axes) -> None:
         return None

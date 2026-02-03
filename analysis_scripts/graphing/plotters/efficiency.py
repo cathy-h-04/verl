@@ -210,6 +210,21 @@ class HardwareROIPlotter(BasePlotter):
         mfu_critic = pd.to_numeric(df.get("data.perf/mfu/critic"), errors="coerce")
         reward = pd.to_numeric(df.get("data.val-core/openai/gsm8k/reward/mean@1"), errors="coerce")
 
+        if not isinstance(mfu_actor, pd.Series):
+            mfu_actor = pd.Series([np.nan] * len(df), index=df.index)
+        if not isinstance(mfu_critic, pd.Series):
+            mfu_critic = pd.Series([np.nan] * len(df), index=df.index)
+        if not isinstance(reward, pd.Series):
+            reward = pd.Series([np.nan] * len(df), index=df.index)
+
+        mfu_actor = mfu_actor.reindex(df.index)
+        mfu_critic = mfu_critic.reindex(df.index)
+        reward = reward.reindex(df.index)
+
+        if len(mfu_actor) != len(x) or len(mfu_critic) != len(x):
+            ax.set_title("MFU series length mismatch.")
+            return
+
         ax.plot(x, mfu_actor, label="MFU Actor", color="#2980b9", linewidth=1.2)
         ax.plot(x, mfu_critic, label="MFU Critic", color="#8e44ad", linewidth=1.2)
         ax.set_xlabel("Step")

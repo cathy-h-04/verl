@@ -315,7 +315,7 @@ class PhaseEnergyTimeStackedPlotter(BasePlotter):
                         f"{frac:.3f}",
                         ha="center",
                         va="center",
-                        fontsize=9,
+                        fontsize=12,
                         color="white",
                         fontweight="bold",
                     )

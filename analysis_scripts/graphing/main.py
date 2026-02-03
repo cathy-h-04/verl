@@ -40,6 +40,7 @@ from .plotters.efficiency import (
     ThroughputVsLengthPlotter,
     TokenBottlenecksPlotter,
 )
+from .analytics.comparisons import generate_quad_views
 
 
 CLEANED_ROOT = Path("monitoring_small_cleaned")
@@ -161,6 +162,10 @@ def main() -> None:
                 print(f"  ✓ {plotter.plot_name}: {out_path}")
             except Exception as exc:  # pragma: no cover
                 print(f"  ✗ {plotter.plot_name}: {exc}")
+
+    quad_outputs = generate_quad_views(runs, args.output_dir, plotter_classes=PLOTTERS, theme=theme)
+    if quad_outputs:
+        print(f"\nQuad-view plots saved to: {args.output_dir / 'quad_plots'}")
 
 
 if __name__ == "__main__":
