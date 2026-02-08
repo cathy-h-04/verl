@@ -4,6 +4,7 @@ Phase profiler for verl RLHF training.
 Provides IPC between controller and monitoring script.
 """
 
+import os
 import time
 import json
 from pathlib import Path
@@ -32,7 +33,12 @@ class PhaseProfiler:
             return
         
         # Use file-based IPC in monitoring directory
-        self.state_file = Path("/home/cathxhou/projects/verl_research/monitoring") / f"phase_state_{experiment_name}.json"
+        monitoring_dir = (
+            os.environ.get("MONITORING_DIR")
+            or os.environ.get("VERL_FILE_LOGGER_ROOT")
+            or "/home/cathxhou/projects/verl_research/monitoring"
+        )
+        self.state_file = Path(monitoring_dir) / f"phase_state_{experiment_name}.json"
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Initialize with idle state
@@ -93,7 +99,12 @@ class PhaseReader:
     """Reader class - used by monitoring script to query current phase."""
     
     def __init__(self, experiment_name: str):
-        self.state_file = Path("/home/cathxhou/projects/verl_research/monitoring") / f"phase_state_{experiment_name}.json"
+        monitoring_dir = (
+            os.environ.get("MONITORING_DIR")
+            or os.environ.get("VERL_FILE_LOGGER_ROOT")
+            or "/home/cathxhou/projects/verl_research/monitoring"
+        )
+        self.state_file = Path(monitoring_dir) / f"phase_state_{experiment_name}.json"
     
     def get_current_phase(self) -> Dict:
         """Read the current phase state."""

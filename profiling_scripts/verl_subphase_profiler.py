@@ -7,6 +7,7 @@ This module provides backwards-compatible enhancement to phase-level profiling
 by capturing the timing_raw dictionary from marked_timer instrumentation.
 """
 
+import os
 import time
 import json
 from pathlib import Path
@@ -48,7 +49,12 @@ class SubPhaseProfiler(PhaseProfiler):
         # Only create timing log if we're doing operation-level profiling
         if self.granularity == 'operation':
             # Create timing log file (JSONL format - one JSON object per line)
-            monitoring_dir = Path("/home/cathxhou/projects/verl_research/monitoring")
+            monitoring_root = (
+                os.environ.get("MONITORING_DIR")
+                or os.environ.get("VERL_FILE_LOGGER_ROOT")
+                or "/home/cathxhou/projects/verl_research/monitoring"
+            )
+            monitoring_dir = Path(monitoring_root) / experiment_name
             monitoring_dir.mkdir(parents=True, exist_ok=True)
             self.timing_log_file = monitoring_dir / f"phase_timings_{experiment_name}.jsonl"
             

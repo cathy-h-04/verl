@@ -8,7 +8,7 @@
 set -e
 
 EXPERIMENT_NAME="${1:-default_experiment}"
-GPU_ID="${2:-0}"
+GPU_ID_ARG="${2:-0}"
 POLL_INTERVAL="${3:-1}"
 NNODES="${4:-na}"
 N_GPUS_PER_NODE="${5:-na}"
@@ -16,8 +16,9 @@ N_GPUS_PER_NODE="${5:-na}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 PROJECT_DIR="/home/cathxhou/projects/verl_research"
 MONITOR_DIR="${MONITORING_DIR:-$PROJECT_DIR/monitoring}"
-mkdir -p "$MONITOR_DIR"
-OUTPUT_FILE="$MONITOR_DIR/${EXPERIMENT_NAME}_phased_${TIMESTAMP}.csv"
+EXPERIMENT_MONITOR_DIR="${MONITOR_DIR}/${EXPERIMENT_NAME}"
+mkdir -p "$EXPERIMENT_MONITOR_DIR"
+OUTPUT_FILE="$EXPERIMENT_MONITOR_DIR/${EXPERIMENT_NAME}_phased_${TIMESTAMP}.csv"
 
 
 # Create Python helper to read phase state
@@ -48,7 +49,18 @@ chmod +x /tmp/read_phase_state_${EXPERIMENT_NAME}.py
 
 echo "=== Phase-Aware GPU Monitor Started ==="
 echo "Experiment: $EXPERIMENT_NAME"
-echo "GPU ID: $GPU_ID"
+GPU_IDS=""
+if [[ "$N_GPUS_PER_NODE" =~ ^[0-9]+$ ]] && [ "$N_GPUS_PER_NODE" -gt 1 ]; then
+    GPU_IDS=$(seq 0 $((N_GPUS_PER_NODE - 1)) | tr '\n' ' ')
+else
+    if [[ "$GPU_ID_ARG" == *","* ]]; then
+        GPU_IDS=$(echo "$GPU_ID_ARG" | tr ',' ' ')
+    else
+        GPU_IDS="$GPU_ID_ARG"
+    fi
+fi
+
+echo "GPU ID(s): $GPU_IDS"
 echo "Poll Interval: ${POLL_INTERVAL}s"
 echo "Nodes: $NNODES (gpus per node: $N_GPUS_PER_NODE)"
 echo "Output: $OUTPUT_FILE"
@@ -70,33 +82,35 @@ while true; do
     PHASE_NAME=$(echo "$PHASE_STATE" | cut -d',' -f2)
     ITERATION=$(echo "$PHASE_STATE" | cut -d',' -f3)
     
-    # Query nvidia-smi
-    GPU_STATS=$(nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,enforced.power.limit,pstate,clocks_throttle_reasons.active,clocks_throttle_reasons.gpu_idle,clocks_throttle_reasons.sw_power_cap,memory.used,memory.total,utilization.memory,utilization.gpu,clocks.current.sm,clocks.current.memory \
-        --format=csv,noheader,nounits \
-        -i "$GPU_ID" 2>/dev/null || echo "$GPU_ID,N/A,0,0,0,0,N/A,0,0,0,0,0,0,0,0,0")
+    for GPU_ID in $GPU_IDS; do
+        # Query nvidia-smi
+        GPU_STATS=$(nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,enforced.power.limit,pstate,clocks_throttle_reasons.active,clocks_throttle_reasons.gpu_idle,clocks_throttle_reasons.sw_power_cap,memory.used,memory.total,utilization.memory,utilization.gpu,clocks.current.sm,clocks.current.memory \
+            --format=csv,noheader,nounits \
+            -i "$GPU_ID" 2>/dev/null || echo "$GPU_ID,N/A,0,0,0,0,N/A,0,0,0,0,0,0,0,0,0")
 
-    # Parse GPU stats
-    IFS=',' read -r gpu_idx gpu_name temp power_draw power_limit enforced_power_limit pstate throttle_active throttle_gpu_idle throttle_sw_power_cap mem_used mem_total mem_util gpu_util sm_clock mem_clock <<< "$GPU_STATS"
-    
-    # Trim whitespace
-    gpu_name=$(echo "$gpu_name" | xargs)
-    temp=$(echo "$temp" | xargs)
-    power_draw=$(echo "$power_draw" | xargs)
-    power_limit=$(echo "$power_limit" | xargs)
-    enforced_power_limit=$(echo "$enforced_power_limit" | xargs)
-    pstate=$(echo "$pstate" | xargs)
-    throttle_active=$(echo "$throttle_active" | xargs)
-    throttle_gpu_idle=$(echo "$throttle_gpu_idle" | xargs)
-    throttle_sw_power_cap=$(echo "$throttle_sw_power_cap" | xargs)
-    mem_used=$(echo "$mem_used" | xargs)
-    mem_total=$(echo "$mem_total" | xargs)
-    mem_util=$(echo "$mem_util" | xargs)
-    gpu_util=$(echo "$gpu_util" | xargs)
-    sm_clock=$(echo "$sm_clock" | xargs)
-    mem_clock=$(echo "$mem_clock" | xargs)
+        # Parse GPU stats
+        IFS=',' read -r gpu_idx gpu_name temp power_draw power_limit enforced_power_limit pstate throttle_active throttle_gpu_idle throttle_sw_power_cap mem_used mem_total mem_util gpu_util sm_clock mem_clock <<< "$GPU_STATS"
+        
+        # Trim whitespace
+        gpu_name=$(echo "$gpu_name" | xargs)
+        temp=$(echo "$temp" | xargs)
+        power_draw=$(echo "$power_draw" | xargs)
+        power_limit=$(echo "$power_limit" | xargs)
+        enforced_power_limit=$(echo "$enforced_power_limit" | xargs)
+        pstate=$(echo "$pstate" | xargs)
+        throttle_active=$(echo "$throttle_active" | xargs)
+        throttle_gpu_idle=$(echo "$throttle_gpu_idle" | xargs)
+        throttle_sw_power_cap=$(echo "$throttle_sw_power_cap" | xargs)
+        mem_used=$(echo "$mem_used" | xargs)
+        mem_total=$(echo "$mem_total" | xargs)
+        mem_util=$(echo "$mem_util" | xargs)
+        gpu_util=$(echo "$gpu_util" | xargs)
+        sm_clock=$(echo "$sm_clock" | xargs)
+        mem_clock=$(echo "$mem_clock" | xargs)
 
-    # Write to CSV
-    echo "$TIMESTAMP,$ELAPSED,$PHASE_ID,$PHASE_NAME,$ITERATION,$NNODES,$N_GPUS_PER_NODE,$GPU_ID,$gpu_name,$temp,$power_draw,$power_limit,$enforced_power_limit,$pstate,$throttle_active,$throttle_gpu_idle,$throttle_sw_power_cap,$mem_used,$mem_total,$mem_util,$gpu_util,$sm_clock,$mem_clock" >> "$OUTPUT_FILE"
+        # Write to CSV
+        echo "$TIMESTAMP,$ELAPSED,$PHASE_ID,$PHASE_NAME,$ITERATION,$NNODES,$N_GPUS_PER_NODE,$GPU_ID,$gpu_name,$temp,$power_draw,$power_limit,$enforced_power_limit,$pstate,$throttle_active,$throttle_gpu_idle,$throttle_sw_power_cap,$mem_used,$mem_total,$mem_util,$gpu_util,$sm_clock,$mem_clock" >> "$OUTPUT_FILE"
+    done
     
     sleep "$POLL_INTERVAL"
 done

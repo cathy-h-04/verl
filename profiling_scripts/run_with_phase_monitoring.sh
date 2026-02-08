@@ -33,6 +33,7 @@ mkdir -p "$MONITORING_DIR"
 cd "$PROJECT_DIR"
 
 export EXPERIMENT_NAME
+export MONITORING_DIR
 
 echo "=========================================="
 echo "verl Phase/Subphase Profiling"
