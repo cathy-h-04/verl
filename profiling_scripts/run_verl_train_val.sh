@@ -15,45 +15,23 @@ GPU_ID="${3:-1}"
 GRANULARITY="${4:-phase}"  # 'phase' or 'operation'
 POLICY="${6:-ppo}"  # ppo | remax
 NNODES="${7:-1}"
-N_GPUS_PER_NODE="${8:-1}"
+N_GPUS_PER_NODE="${8:-2}"
 DATASET_NAME="${9:-gsm8k}"
 VAL_FREQ="${10:-1}"  # validation frequency in training steps
 export EXPERIMENT_NAME
 
+# Rollout tensor parallel size
+TENSOR_PARALLEL_SIZE=1
 # Batch size configuration - SMALL for fast profiling
 TRAIN_BATCH_SIZE=16
-PPO_MINI_BATCH_SIZE=8
-MICRO_BATCH_SIZE_PER_GPU=2
+PPO_MINI_BATCH_SIZE=4
+MICRO_BATCH_SIZE_PER_GPU=1
 LOG_PROB_MICRO_BATCH_SIZE=4
-GPU_MEMORY_UTIL=0.6
-ROLLOUT_MAX_BATCHED_TOKENS=4096
-ROLLOUT_MAX_MODEL_LEN=1536
-ROLLOUT_MAX_NUM_SEQS=1024
-ENABLE_GRAD_CHECKPOINTING=false
-
-if [[ "$MODEL_NAME" == *"Llama-3.1"* ]]; then
-    GPU_MEMORY_UTIL=0.2
-    ROLLOUT_MAX_BATCHED_TOKENS=768
-    ROLLOUT_MAX_MODEL_LEN=768
-    ROLLOUT_MAX_NUM_SEQS=512
-    TRAIN_BATCH_SIZE=8
-    PPO_MINI_BATCH_SIZE=4
-    MICRO_BATCH_SIZE_PER_GPU=1
-    LOG_PROB_MICRO_BATCH_SIZE=1
-    ENABLE_GRAD_CHECKPOINTING=true
-    echo "Detected Llama-3.1; using smaller batches and reduced vLLM cache"
-elif [[ "$MODEL_NAME" == *"Mistral"* ]]; then
-    GPU_MEMORY_UTIL=0.25
-    ROLLOUT_MAX_BATCHED_TOKENS=1024
-    ROLLOUT_MAX_MODEL_LEN=1024
-    ROLLOUT_MAX_NUM_SEQS=256
-    TRAIN_BATCH_SIZE=8
-    PPO_MINI_BATCH_SIZE=4
-    MICRO_BATCH_SIZE_PER_GPU=1
-    LOG_PROB_MICRO_BATCH_SIZE=1
-    ENABLE_GRAD_CHECKPOINTING=true
-    echo "Detected Mistral; using smaller batches and reduced vLLM cache"
-fi
+GPU_MEMORY_UTIL=0.30
+ROLLOUT_MAX_BATCHED_TOKENS=1536
+ROLLOUT_MAX_MODEL_LEN=1024
+ROLLOUT_MAX_NUM_SEQS=64
+ENABLE_GRAD_CHECKPOINTING=true
 
 # -------------------- Environment Setup --------------------
 cd "$PROJECT_DIR"
@@ -70,7 +48,8 @@ if [ "$N_GPUS_PER_NODE" -le 1 ]; then
 fi
 export PYTHONUNBUFFERED=1
 # Structured file logging (JSONL) goes to monitoring_val/<project>/<experiment>.jsonl
-export VERL_FILE_LOGGER_ROOT="${PROJECT_DIR}/monitoring_val"
+MONITORING_DIR="${MONITORING_DIR:-${PROJECT_DIR}/monitoring_val}"
+export VERL_FILE_LOGGER_ROOT="$MONITORING_DIR"
 
 # Flash attention enabled (requires compatible flash-attn install)
 # export VLLM_DISABLE_FLASHINFER=1  # uncomment if flashinfer causes issues
@@ -160,6 +139,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.model.enable_gradient_checkpointing=$ENABLE_GRAD_CHECKPOINTING \
   actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
+  actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.mode=sync \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
@@ -167,12 +147,14 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.enable_chunked_prefill=False \
   actor_rollout_ref.rollout.max_model_len=$ROLLOUT_MAX_MODEL_LEN \
   actor_rollout_ref.rollout.max_num_seqs=$ROLLOUT_MAX_NUM_SEQS \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL_SIZE \
   actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTIL \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
+  actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
   critic.model.path="$MODEL_NAME" \
   critic.optim.lr=1e-5 \
   critic.model.enable_gradient_checkpointing=$ENABLE_GRAD_CHECKPOINTING \
+  critic.model.fsdp_config.model_dtype=bfloat16 \
   critic.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \
   algorithm.kl_ctrl.kl_coef=0.001 \
   trainer.logger=[console,file] \
