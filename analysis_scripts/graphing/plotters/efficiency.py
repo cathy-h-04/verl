@@ -369,21 +369,42 @@ class BottleneckEvolutionPlotter(BasePlotter):
             return
         df = self.merged_df.copy()
         reward_col = "data.val-core/openai/gsm8k/reward/mean@1"
-        if reward_col not in df.columns:
-            ax.set_title("Missing reward column.")
-            return
         timing_cols = [c for c in df.columns if c.startswith("data.timing_per_token_ms/")]
         if not timing_cols:
             ax.set_title("No per-token timing columns found.")
             return
 
-        reward = pd.to_numeric(df[reward_col], errors="coerce")
-        early_mask = reward < 0.1
-        mature_mask = reward > 0.4
+        reward = None
+        early_mask = None
+        mature_mask = None
+        subtitle = None
 
-        if early_mask.sum() == 0 or mature_mask.sum() == 0:
-            ax.set_title("Insufficient early/mature reward samples.")
-            return
+        if reward_col in df.columns:
+            reward = pd.to_numeric(df[reward_col], errors="coerce")
+            finite_reward = reward.dropna()
+            if not finite_reward.empty:
+                q_low = float(finite_reward.quantile(0.2))
+                q_high = float(finite_reward.quantile(0.8))
+                if q_low < q_high:
+                    early_mask = reward <= q_low
+                    mature_mask = reward >= q_high
+                    subtitle = "Early/Mature by reward (p20/p80)"
+
+        if early_mask is None or mature_mask is None or early_mask.sum() == 0 or mature_mask.sum() == 0:
+            # Fallback: use step percentiles when reward thresholds are not usable.
+            if "step" not in df.columns:
+                ax.set_title("Insufficient reward data and missing step column.")
+                return
+            steps = pd.to_numeric(df["step"], errors="coerce")
+            finite_steps = steps.dropna()
+            if finite_steps.empty:
+                ax.set_title("Insufficient reward data and invalid steps.")
+                return
+            s_low = float(finite_steps.quantile(0.2))
+            s_high = float(finite_steps.quantile(0.8))
+            early_mask = steps <= s_low
+            mature_mask = steps >= s_high
+            subtitle = "Early/Mature by step (p20/p80)"
 
         early_means = {col: pd.to_numeric(df.loc[early_mask, col], errors="coerce").mean() for col in timing_cols}
         mature_means = {col: pd.to_numeric(df.loc[mature_mask, col], errors="coerce").mean() for col in timing_cols}
@@ -400,6 +421,17 @@ class BottleneckEvolutionPlotter(BasePlotter):
         ax.invert_yaxis()
         ax.set_xlabel("Time per token (ms)")
         ax.set_title("Bottleneck Evolution")
+        if subtitle:
+            ax.text(
+                0.99,
+                1.02,
+                subtitle,
+                transform=ax.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=8,
+                color="#555555",
+            )
         ax.grid(True, axis="x", alpha=self.theme.grid_alpha)
         ax.legend(loc="upper right")
 
@@ -479,11 +511,10 @@ class OperationComparisonPlotter(BasePlotter):
         ("gpu_util_percent", "GPU Util (%)"),
         ("temperature_c", "Temperature (°C)"),
         ("memory_used_gb", "Memory Used (GB)"),
-        ("power_to_limit_ratio", "Power / Limit"),
     )
 
     def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
         suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
         fig.suptitle(suptitle, fontsize=12, fontweight="bold")
         return fig, axes

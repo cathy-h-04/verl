@@ -14,7 +14,14 @@ try:
 except Exception:  # pragma: no cover
     sns = None
 
-from ..core.base import BasePlotter, PHASE_COLORS, PHASE_OPERATION_ORDER, EXCLUDED_OPERATIONS, format_title
+from ..core.base import (
+    BasePlotter,
+    PHASE_COLORS,
+    PHASE_OPERATION_ORDER,
+    EXCLUDED_OPERATIONS,
+    OPERATION_COLORS,
+    format_title,
+)
 from ..core.loaders import compute_phase_windows_from_annotated, compute_sample_durations_seconds
 
 
@@ -465,7 +472,7 @@ class PhaseCorrelationPlotter(BasePlotter):
 
 
 class HierarchicalWaterfallPlotter(BasePlotter):
-    """Single-iteration waterfall chart showing phase + subphase breakdown."""
+    """Mean operation breakdown by phase (stacked bars)."""
 
     plot_name = "hierarchical_waterfall"
     plot_title = "Hierarchical Work Breakdown"
@@ -486,40 +493,34 @@ class HierarchicalWaterfallPlotter(BasePlotter):
         df = self.timings_df.copy()
         df["iteration"] = pd.to_numeric(df["iteration"], errors="coerce")
         df = df.dropna(subset=["iteration"])
-
-        target_iter = self.target_iteration
-        if target_iter not in df["iteration"].unique():
-            unique_iters = sorted(df["iteration"].unique())
-            if not unique_iters:
-                ax.set_title("No valid iterations found.")
-                return
-            target_iter = unique_iters[len(unique_iters) // 2]
-
-        df = df[df["iteration"] == target_iter]
         if df.empty:
-            ax.set_title("No data for selected iteration.")
+            ax.set_title("No valid iterations found.")
             return
 
-        phase_segments: Dict[str, List[Tuple[str, float]]] = {}
         phase_order = ["rollout", "rl_policy", "training"]
-        for phase in phase_order:
-            phase_row = df[df["phase"] == phase]
-            if phase_row.empty:
-                continue
-            row = phase_row.iloc[0].to_dict()
-            ops = {k: float(v) for k, v in row.items() if k not in {"iteration", "phase", "timestamp"} and isinstance(v, (int, float))}
+        phase_segments: Dict[str, List[Tuple[str, float]]] = {}
 
+        for phase in phase_order:
+            phase_df = df[df["phase"] == phase]
+            if phase_df.empty:
+                continue
+            ops = {
+                k: pd.to_numeric(phase_df[k], errors="coerce").mean()
+                for k in phase_df.columns
+                if k not in {"iteration", "phase", "timestamp"}
+            }
             ordered_ops = PHASE_OPERATION_ORDER.get(phase, [])
             segments: List[Tuple[str, float]] = []
             if ordered_ops:
                 for op in ordered_ops:
-                    if op in ops and op not in EXCLUDED_OPERATIONS:
-                        segments.append((op, ops[op]))
+                    if op in ops and op not in EXCLUDED_OPERATIONS and ops[op] and ops[op] > 0:
+                        segments.append((op, float(ops[op])))
             else:
-                for op, duration in sorted(ops.items()):
+                for op, duration in sorted(ops.items(), key=lambda kv: kv[1], reverse=True):
                     if op in EXCLUDED_OPERATIONS:
                         continue
-                    segments.append((op, duration))
+                    if duration and duration > 0:
+                        segments.append((op, float(duration)))
             if segments:
                 phase_segments[phase] = segments
 
@@ -529,17 +530,22 @@ class HierarchicalWaterfallPlotter(BasePlotter):
 
         y_ticks = []
         y_labels = []
+        legend_handles = []
+        legend_labels = []
         y_pos = 0
         for phase in phase_order:
             if phase not in phase_segments:
                 continue
             start = 0.0
             for op, duration in phase_segments[phase]:
-                color = PHASE_COLORS.get(phase, PHASE_COLORS["unknown"])
-                ax.barh(y_pos, duration, left=start, height=0.6, color=color, alpha=0.8, edgecolor="white")
-                if duration > 0:
-                    ax.text(start + duration / 2.0, y_pos, op, ha="center", va="center", fontsize=7, color="black")
+                color = OPERATION_COLORS.get(op, OPERATION_COLORS.get("unknown", "#95a5a6"))
+                if phase == "rl_policy" and op == "values":
+                    color = "#f5b041"
+                ax.barh(y_pos, duration, left=start, height=0.6, color=color, alpha=0.9, edgecolor="white")
                 start += duration
+                if op not in legend_labels:
+                    legend_handles.append(plt.Rectangle((0, 0), 1, 1, color=color))
+                    legend_labels.append(op)
             y_ticks.append(y_pos)
             y_labels.append(phase)
             y_pos += 1
@@ -547,5 +553,13 @@ class HierarchicalWaterfallPlotter(BasePlotter):
         ax.set_yticks(y_ticks)
         ax.set_yticklabels(y_labels)
         ax.set_xlabel("Time (s)")
-        ax.set_title(f"Iteration {int(target_iter)}")
+        ax.set_title("Mean Operation Durations by Phase")
         ax.grid(True, axis="x", alpha=self.theme.grid_alpha)
+        if legend_handles:
+            ax.legend(
+                legend_handles,
+                legend_labels,
+                loc="upper right",
+                fontsize=8,
+                frameon=False,
+            )

@@ -84,19 +84,19 @@ class ThemeConfig:
     palette: str = "deep"
     figure_dpi: int = 150
     save_dpi: int = 300
-    font_size: int = 10
-    axes_label_size: int = 11
-    axes_title_size: int = 12
-    legend_font_size: int = 9
+    font_size: int = 12
+    axes_label_size: int = 13
+    axes_title_size: int = 14
+    legend_font_size: int = 11
     grid_alpha: float = 0.25
     rc_params: Mapping[str, object] = field(
         default_factory=lambda: {
             "figure.dpi": 150,
             "savefig.dpi": 300,
-            "font.size": 10,
-            "axes.labelsize": 11,
-            "axes.titlesize": 12,
-            "legend.fontsize": 9,
+            "font.size": 12,
+            "axes.labelsize": 13,
+            "axes.titlesize": 14,
+            "legend.fontsize": 11,
         }
     )
 

@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import inspect
+import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from matplotlib.patches import Patch, PathPatch
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
@@ -17,7 +20,8 @@ try:
 except Exception:  # pragma: no cover
     sns = None
 
-from ..core.base import ThemeConfig, apply_theme, EXCLUDED_OPERATIONS, PHASE_OPERATION_ORDER
+from ..core.base import ThemeConfig, apply_theme, EXCLUDED_OPERATIONS, PHASE_OPERATION_ORDER, OPERATION_COLORS
+from ..core.style_config import RunStyleConfig
 from ..core.loaders import RunPaths, compute_sample_durations_seconds
 from ..plotters.hardware import (
     GPUOverviewPlotter,
@@ -51,7 +55,7 @@ from ..plotters.efficiency import (
 
 
 def get_clean_label(run_name: str) -> str:
-    """Return a readable label like 'Small (1.5B) | PPO | 2 GPUs'."""
+    """Return a readable label like 'Qwen2.5-3B | PPO | 2 GPUs'."""
     parts = [p for p in run_name.lower().split("_") if p]
 
     def looks_like_date(token: str) -> bool:
@@ -69,26 +73,29 @@ def get_clean_label(run_name: str) -> str:
     algo_map = {
         "ppo": "PPO",
         "remax": "ReMax",
+        "grpo": "GRPO",
         "dpo": "DPO",
         "sft": "SFT",
     }
-    model_map = {
-        "small": "Small (1.5B)",
-        "medium": "Medium",
-        "large": "Large",
-        "xl": "XL",
-        "xxl": "XXL",
+    model_size_map = {
+        ("qwen2.5", "small"): "Qwen2.5-1.5B",
+        ("qwen2.5", "large"): "Qwen2.5-3B",
+        ("llama3.1", "large"): "Llama3.1-8B",
     }
 
     algo_label = None
     model_label = None
     gpu_count = None
+    model_token = None
+    size_token = None
 
     for token in parts:
+        if model_token is None and (token.startswith("qwen") or token.startswith("llama")):
+            model_token = token
+        if size_token is None and token in {"small", "medium", "large", "xl", "xxl"}:
+            size_token = token
         if algo_label is None and token in algo_map:
             algo_label = algo_map[token]
-        if model_label is None and token in model_map:
-            model_label = model_map[token]
         if gpu_count is None:
             if token.endswith("gpn") and token[:-3].isdigit():
                 gpu_count = int(token[:-3])
@@ -96,6 +103,9 @@ def get_clean_label(run_name: str) -> str:
                 gpu_count = int(token[:-3])
             elif token.isdigit() and "gpu" in parts:
                 gpu_count = int(token)
+
+    if model_label is None and model_token and size_token:
+        model_label = model_size_map.get((model_token, size_token))
 
     if model_label is None:
         for token in parts:
@@ -130,6 +140,7 @@ def _extract_algo_and_gpu(run_name: str) -> Tuple[str, Optional[int]]:
     algo_map = {
         "ppo": "PPO",
         "remax": "ReMax",
+        "grpo": "GRPO",
         "dpo": "DPO",
         "sft": "SFT",
     }
@@ -152,6 +163,154 @@ def _extract_algo_and_gpu(run_name: str) -> Tuple[str, Optional[int]]:
         algo_label = "Unknown Algo"
 
     return algo_label, gpu_count
+
+
+def _extract_model_family(run_name: str) -> str:
+    parts = [p for p in run_name.lower().split("_") if p]
+
+    def looks_like_date(token: str) -> bool:
+        return len(token) == 8 and token.isdigit()
+
+    def looks_like_time(token: str) -> bool:
+        return len(token) == 6 and token.isdigit()
+
+    while parts and (looks_like_date(parts[-1]) or looks_like_time(parts[-1])):
+        parts = parts[:-1]
+
+    for token in parts:
+        if token.startswith("llama3.1") or token.startswith("llama"):
+            return "llama3.1"
+        if token.startswith("qwen2.5") or token.startswith("qwen"):
+            return "qwen2.5"
+    return "unknown"
+
+
+def _quad_run_sort_key(run: RunPaths) -> Tuple[int, int, int, str]:
+    algo_order = {
+        "ppo": 0,
+        "remax": 1,
+        "grpo": 2,
+        "dpo": 3,
+        "sft": 4,
+    }
+    model_order = {
+        "llama3.1": 0,
+        "qwen2.5": 1,
+    }
+    algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
+    algo_key = algo_label.lower()
+    model_key = _extract_model_family(run.run_name)
+    return (
+        model_order.get(model_key, 99),
+        algo_order.get(algo_key, 99),
+        gpu_count if gpu_count is not None else 99,
+        run.run_name,
+    )
+
+
+def _legend_sort_key(run_name: str, label: str, gpu_count: Optional[int] = None) -> Tuple[int, int, int, str]:
+    algo_order = {
+        "ppo": 0,
+        "remax": 1,
+        "grpo": 2,
+        "dpo": 3,
+        "sft": 4,
+    }
+    model_order = {
+        "llama3.1": 0,
+        "qwen2.5": 1,
+    }
+    algo_label, parsed_gpu = _extract_algo_and_gpu(run_name)
+    algo_key = algo_label.lower()
+    model_key = _extract_model_family(run_name)
+    gpu_value = gpu_count if gpu_count is not None else parsed_gpu
+    return (
+        algo_order.get(algo_key, 99),
+        model_order.get(model_key, 99),
+        gpu_value if gpu_value is not None else 99,
+        label,
+    )
+
+
+def _default_algo_cmaps() -> Dict[str, str]:
+    return {
+        "PPO": "Blues",
+        "ReMax": "Oranges",
+        "DPO": "Greens",
+        "SFT": "Purples",
+    }
+
+
+def _build_algo_color_map(
+    run_meta: Iterable[Tuple[str, Optional[int]]],
+    algo_cmaps: Mapping[str, str],
+) -> Dict[Tuple[str, int], Tuple[float, float, float, float]]:
+    algo_gpu_counts: Dict[str, List[int]] = {}
+    for algo_label, gpu_count in run_meta:
+        if gpu_count is not None:
+            algo_gpu_counts.setdefault(algo_label, []).append(gpu_count)
+
+    algo_color_map: Dict[Tuple[str, int], Tuple[float, float, float, float]] = {}
+    for algo_label, counts in algo_gpu_counts.items():
+        unique_counts = sorted(set(counts))
+        if not unique_counts:
+            continue
+        cmap_name = algo_cmaps.get(algo_label, "Greys")
+        cmap = plt.get_cmap(cmap_name)
+        if len(unique_counts) == 1:
+            algo_color_map[(algo_label, unique_counts[0])] = cmap(0.65)
+            continue
+        for idx, count in enumerate(unique_counts):
+            frac = idx / (len(unique_counts) - 1)
+            shade = 0.35 + 0.5 * frac
+            algo_color_map[(algo_label, count)] = cmap(shade)
+    return algo_color_map
+
+
+def _style_defaults(
+    style_config: Optional[RunStyleConfig],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if style_config is None:
+        return None, None, None
+    return (
+        style_config.defaults.color,
+        style_config.defaults.hatch,
+        style_config.defaults.linestyle,
+    )
+
+
+def _resolve_run_style(
+    run_name: str,
+    label: str,
+    algo_label: str,
+    gpu_count: Optional[int],
+    style_config: Optional[RunStyleConfig],
+    algo_color_map: Mapping[Tuple[str, int], Tuple[float, float, float, float]],
+    unknown_color: str,
+    algo_hatches: Optional[Mapping[str, str]] = None,
+    algo_linestyles: Optional[Mapping[str, object]] = None,
+    plot_name: Optional[str] = None,
+) -> Tuple[object, str, object]:
+    default_color, default_hatch, default_linestyle = _style_defaults(style_config)
+    rule = style_config.match(run_name, label, plot_name) if style_config else None
+
+    color = rule.color if rule and rule.color else default_color
+    if color is None:
+        color = algo_color_map.get((algo_label, gpu_count)) if gpu_count is not None else None
+    if color is None:
+        color = unknown_color
+
+    hatch = rule.hatch if rule and rule.hatch is not None else default_hatch
+    if hatch is None:
+        hatch = algo_hatches.get(algo_label, "") if algo_hatches else ""
+
+    linestyle = rule.linestyle if rule and rule.linestyle is not None else default_linestyle
+    if linestyle is None:
+        linestyle = algo_linestyles.get(algo_label, "-") if algo_linestyles else "-"
+
+    if isinstance(color, str):
+        color = mcolors.to_rgba(color)
+    return color, hatch, linestyle
 
 
 def _merge_bounds(
@@ -223,9 +382,13 @@ def _apply_limits(
         ax.set_ylim(*y_bounds)
 
 
+_QUAD_GRID_SHAPE: Tuple[int, int] = (2, 2)
+
+
 def _create_quad_figure(base_size: Tuple[float, float]) -> Tuple[plt.Figure, GridSpec]:
-    fig = plt.figure(figsize=(base_size[0] * 2.0, base_size[1] * 2.0))
-    outer = GridSpec(2, 2, figure=fig, wspace=0.2, hspace=0.35)
+    rows, cols = _QUAD_GRID_SHAPE
+    fig = plt.figure(figsize=(base_size[0] * cols, base_size[1] * rows))
+    outer = GridSpec(rows, cols, figure=fig, wspace=0.2, hspace=0.35)
     return fig, outer
 
 
@@ -238,8 +401,12 @@ def _make_inner_axes(
     sharex: bool = False,
     sharey: bool = False,
 ) -> np.ndarray:
-    row = index // 2
-    col = index % 2
+    grid_rows, grid_cols = _QUAD_GRID_SHAPE
+    row = index // grid_cols
+    col = index % grid_cols
+    if row >= grid_rows or col >= grid_cols:
+        row = min(row, grid_rows - 1)
+        col = min(col, grid_cols - 1)
     inner = GridSpecFromSubplotSpec(rows, cols, subplot_spec=outer[row, col], wspace=0.3, hspace=0.35)
     axes = np.empty((rows, cols), dtype=object)
     sharex_ax = None
@@ -261,10 +428,25 @@ def _make_inner_axes(
     return axes
 
 
-QUAD_LABEL_SIZE = 12
-QUAD_TICK_SIZE = 10
-QUAD_TITLE_SIZE = 12
-QUAD_QUADRANT_TITLE_SIZE = 13
+QUAD_LABEL_SIZE = 13
+QUAD_TICK_SIZE = 11
+QUAD_TITLE_SIZE = 13
+QUAD_QUADRANT_TITLE_SIZE = 14
+
+
+def _grid_dims(num_runs: int) -> Tuple[int, int]:
+    if num_runs <= 3:
+        cols = max(1, num_runs)
+    elif num_runs <= 6:
+        cols = 3
+    elif num_runs <= 8:
+        cols = 4
+    elif num_runs <= 10:
+        cols = 5
+    else:
+        cols = 6
+    rows = int(math.ceil(num_runs / cols))
+    return rows, cols
 
 
 def _scale_axes_text(axes: np.ndarray) -> None:
@@ -539,6 +721,7 @@ def _quad_thermal_steady_state(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     x_bounds = _bounds_for_column(runs, "annotated_df", "elapsed_minutes")
     y_bounds = _bounds_for_column(runs, "annotated_df", "temperature_c")
@@ -559,6 +742,97 @@ def _quad_thermal_steady_state(
         _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
 
     out_path = output_dir / f"{ThermalSteadyStatePlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    _combined_thermal_steady_state(
+        runs,
+        output_dir,
+        theme,
+        x_bounds,
+        y_bounds,
+        style_config=style_config,
+    )
+    return out_path
+
+
+def _combined_thermal_steady_state(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    x_bounds: Optional[Tuple[float, float]],
+    y_bounds: Optional[Tuple[float, float]],
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, ax = plt.subplots(1, 1, figsize=(8.5, 5.1))
+
+    algo_linestyles = {
+        "PPO": "-",
+        "ReMax": (0, (6, 4)),
+        "GRPO": (0, (6, 4)),
+        "DPO": (0, (5, 2, 1, 2)),
+        "SFT": (0, (1, 6)),
+    }
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [_extract_algo_and_gpu(run.run_name) for run in runs],
+        algo_cmaps,
+    )
+    unknown_color = "#7f8c8d"
+
+    plotted = 0
+    ordered_runs = sorted(
+        runs,
+        key=lambda run: _legend_sort_key(run.run_name, get_clean_label(run.run_name)),
+    )
+    for run in ordered_runs:
+        df = run.annotated_df
+        if df is None or df.empty:
+            continue
+        if "elapsed_minutes" not in df.columns or "temperature_c" not in df.columns:
+            continue
+        x_vals = pd.to_numeric(df["elapsed_minutes"], errors="coerce")
+        y_vals = pd.to_numeric(df["temperature_c"], errors="coerce")
+        mask = x_vals.notna() & y_vals.notna()
+        if not mask.any():
+            continue
+        label = get_clean_label(run.run_name)
+        algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
+        color, _, linestyle = _resolve_run_style(
+            run_name=run.run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_linestyles=algo_linestyles,
+            plot_name=ThermalSteadyStatePlotter.plot_name,
+        )
+        ax.plot(
+            x_vals[mask],
+            y_vals[mask],
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.6,
+            alpha=0.6,
+            label=label,
+        )
+        plotted += 1
+
+    if plotted == 0:
+        ax.set_title("Thermal steady state (missing data)")
+    else:
+        ax.set_title("Thermal Steady State (All Runs)")
+        ax.legend(loc="best", fontsize=QUAD_TICK_SIZE)
+
+    ax.set_xlabel("Elapsed Minutes")
+    ax.set_ylabel("Temperature (°C)")
+    ax.grid(True, alpha=theme.grid_alpha)
+    _apply_limits(ax, x_bounds, y_bounds)
+    fig.tight_layout()
+
+    out_path = output_dir / f"{ThermalSteadyStatePlotter.plot_name}_all_runs.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
     plt.close(fig)
     return out_path
@@ -641,6 +915,7 @@ def _quad_phase_aggregate(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     metrics = [
         ("avg_gpu_util", "Average GPU Util (%)"),
@@ -651,7 +926,7 @@ def _quad_phase_aggregate(
 
     summaries: List[pd.DataFrame] = []
     run_labels: List[str] = []
-    run_meta: List[Tuple[str, Optional[int], str]] = []
+    run_meta: List[Tuple[str, Optional[int], str, str, str]] = []
     for run in runs:
         summary = _phase_aggregate_summary(run.annotated_df)
         if summary is None:
@@ -660,7 +935,17 @@ def _quad_phase_aggregate(
         label = get_clean_label(run.run_name)
         run_labels.append(label)
         algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
-        run_meta.append((algo_label, gpu_count, label))
+        model_family = _extract_model_family(run.run_name)
+        run_meta.append((algo_label, gpu_count, label, run.run_name, model_family))
+
+    if run_meta:
+        order = sorted(
+            range(len(run_meta)),
+            key=lambda i: _legend_sort_key(run_meta[i][3], run_meta[i][2], run_meta[i][1]),
+        )
+        run_meta = [run_meta[i] for i in order]
+        summaries = [summaries[i] for i in order]
+        run_labels = [run_labels[i] for i in order]
 
     apply_theme(theme)
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
@@ -700,48 +985,29 @@ def _quad_phase_aggregate(
     algo_hatches = {
         "ReMax": "\\\\",
     }
-
-    algo_cmaps = {
-        "PPO": "Blues",
-        "ReMax": "Oranges",
-        "DPO": "Greens",
-        "SFT": "Purples",
-    }
-
-    algo_gpu_counts: Dict[str, List[int]] = {}
-    for algo_label, gpu_count, _ in run_meta:
-        if gpu_count is not None:
-            algo_gpu_counts.setdefault(algo_label, []).append(gpu_count)
-
-    algo_color_map: Dict[Tuple[str, int], Tuple[float, float, float, float]] = {}
-    for algo_label, counts in algo_gpu_counts.items():
-        unique_counts = sorted(set(counts))
-        if not unique_counts:
-            continue
-        cmap_name = algo_cmaps.get(algo_label, "Greys")
-        cmap = plt.get_cmap(cmap_name)
-        if len(unique_counts) == 1:
-            algo_color_map[(algo_label, unique_counts[0])] = cmap(0.65)
-            continue
-        for idx, count in enumerate(unique_counts):
-            frac = idx / (len(unique_counts) - 1)
-            shade = 0.35 + 0.5 * frac
-            algo_color_map[(algo_label, count)] = cmap(shade)
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [(algo_label, gpu_count) for algo_label, gpu_count, _, _, _ in run_meta],
+        algo_cmaps,
+    )
 
     unknown_color = "#7f8c8d"
 
     for metric_idx, (metric, title) in enumerate(metrics):
         ax = np.ravel(axes)[metric_idx]
         for run_idx, summary in enumerate(summaries):
-            algo_label, gpu_count, _ = run_meta[run_idx]
-            color = (
-                algo_color_map.get((algo_label, gpu_count))
-                if gpu_count is not None
-                else None
+            algo_label, gpu_count, label, run_name, _ = run_meta[run_idx]
+            color, hatch, _ = _resolve_run_style(
+                run_name=run_name,
+                label=label,
+                algo_label=algo_label,
+                gpu_count=gpu_count,
+                style_config=style_config,
+                algo_color_map=algo_color_map,
+                unknown_color=unknown_color,
+                algo_hatches=algo_hatches,
+                plot_name=PhaseAggregatePlotter.plot_name,
             )
-            if color is None:
-                color = unknown_color
-            hatch = algo_hatches.get(algo_label, "")
             values = []
             for phase in phases:
                 match = summary.loc[summary["phase_name"] == phase, metric]
@@ -768,26 +1034,29 @@ def _quad_phase_aggregate(
         _apply_limits(ax, None, y_bounds.get(metric))
 
     legend_handles = []
-    for algo_label, gpu_count, run_label in run_meta:
-        color = (
-            algo_color_map.get((algo_label, gpu_count))
-            if gpu_count is not None
-            else None
+    for algo_label, gpu_count, run_label, run_name, _ in run_meta:
+        color, hatch, _ = _resolve_run_style(
+            run_name=run_name,
+            label=run_label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_hatches=algo_hatches,
+            plot_name=PhaseAggregatePlotter.plot_name,
         )
-        if color is None:
-            color = unknown_color
-        hatch = algo_hatches.get(algo_label, "")
         legend_handles.append(Patch(facecolor=color, edgecolor="#2c3e50", hatch=hatch, label=run_label))
 
     fig.suptitle("Phase Aggregates (Grouped by Run)", fontsize=12, fontweight="bold", y=0.98)
     fig.legend(
         handles=legend_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.93),
+        bbox_to_anchor=(0.5, 0.955),
         ncol=min(4, len(legend_handles)),
         frameon=False,
     )
-    fig.subplots_adjust(top=0.88, bottom=0.12, hspace=0.35, wspace=0.25)
+    fig.subplots_adjust(top=0.80, bottom=0.12, hspace=0.35, wspace=0.25)
 
     out_path = output_dir / f"{PhaseAggregatePlotter.plot_name}_quad_view.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
@@ -801,6 +1070,7 @@ def _quad_phase_focus(
     theme: ThemeConfig,
     plotter_cls,
     plot_name: str,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     metrics = plotter_cls.metrics
     focus_window = plotter_cls.focus_window
@@ -817,7 +1087,7 @@ def _quad_phase_focus(
             force_iteration = True
         run_inputs.append((run, df, x_col))
 
-    run_data: List[Tuple[pd.DataFrame, str, str, Optional[int], str]] = []
+    run_data: List[Tuple[pd.DataFrame, str, str, Optional[int], str, str]] = []
     for run, df, x_col in run_inputs:
         if "phase_name" not in df.columns:
             continue
@@ -831,14 +1101,19 @@ def _quad_phase_focus(
             x_col = "iteration"
         label = get_clean_label(run.run_name)
         algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
-        run_data.append((df, x_col, label, gpu_count, algo_label))
+        run_data.append((df, x_col, label, gpu_count, algo_label, run.run_name))
 
     if not run_data:
         return None
 
+    run_data = sorted(
+        run_data,
+        key=lambda item: _legend_sort_key(item[5], item[2], item[3]),
+    )
+
     x_bounds = None
     y_bounds = {metric: None for metric, _ in metrics}
-    for df, x_col, _, _, _ in run_data:
+    for df, x_col, _, _, _, _ in run_data:
         if x_col in df.columns:
             x_bounds = _merge_bounds(x_bounds, _finite_min_max(pd.to_numeric(df[x_col], errors="coerce")))
         for metric, _ in metrics:
@@ -850,32 +1125,11 @@ def _quad_phase_focus(
     x_bounds = _pad_bounds(x_bounds)
     y_bounds = {metric: _pad_bounds(bounds) for metric, bounds in y_bounds.items()}
 
-    algo_cmaps = {
-        "PPO": "Blues",
-        "ReMax": "Oranges",
-        "DPO": "Greens",
-        "SFT": "Purples",
-    }
-
-    algo_gpu_counts: Dict[str, List[int]] = {}
-    for _, _, _, gpu_count, algo_label in run_data:
-        if gpu_count is not None:
-            algo_gpu_counts.setdefault(algo_label, []).append(gpu_count)
-
-    algo_color_map: Dict[Tuple[str, int], Tuple[float, float, float, float]] = {}
-    for algo_label, counts in algo_gpu_counts.items():
-        unique_counts = sorted(set(counts))
-        if not unique_counts:
-            continue
-        cmap_name = algo_cmaps.get(algo_label, "Greys")
-        cmap = plt.get_cmap(cmap_name)
-        if len(unique_counts) == 1:
-            algo_color_map[(algo_label, unique_counts[0])] = cmap(0.65)
-            continue
-        for idx, count in enumerate(unique_counts):
-            frac = idx / (len(unique_counts) - 1)
-            shade = 0.35 + 0.5 * frac
-            algo_color_map[(algo_label, count)] = cmap(shade)
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [(algo_label, gpu_count) for _, _, _, gpu_count, algo_label, _ in run_data],
+        algo_cmaps,
+    )
 
     unknown_color = "#7f8c8d"
     algo_linestyles = {
@@ -890,7 +1144,7 @@ def _quad_phase_focus(
     axes = np.asarray(axes)
 
     for ax, (metric, ylabel) in zip(np.ravel(axes), metrics):
-        for df, x_col, label, gpu_count, algo_label in run_data:
+        for df, x_col, label, gpu_count, algo_label, run_name in run_data:
             if metric not in df.columns or x_col not in df.columns:
                 continue
             x_vals = pd.to_numeric(df[x_col], errors="coerce")
@@ -898,14 +1152,17 @@ def _quad_phase_focus(
             mask = x_vals.notna() & y_vals.notna()
             if not mask.any():
                 continue
-            color = (
-                algo_color_map.get((algo_label, gpu_count))
-                if gpu_count is not None
-                else None
+            color, _, linestyle = _resolve_run_style(
+                run_name=run_name,
+                label=label,
+                algo_label=algo_label,
+                gpu_count=gpu_count,
+                style_config=style_config,
+                algo_color_map=algo_color_map,
+                unknown_color=unknown_color,
+                algo_linestyles=algo_linestyles,
+                plot_name=plot_name,
             )
-            if color is None:
-                color = unknown_color
-            linestyle = algo_linestyles.get(algo_label, "-")
             ax.plot(
                 x_vals[mask],
                 y_vals[mask],
@@ -929,13 +1186,13 @@ def _quad_phase_focus(
             handles,
             labels,
             loc="upper center",
-            bbox_to_anchor=(0.5, 0.93),
+            bbox_to_anchor=(0.5, 0.955),
             ncol=min(4, len(labels)),
             frameon=False,
         )
 
     fig.suptitle(f"Iteration Focus: {focus_phase}", fontsize=12, fontweight="bold", y=0.98)
-    fig.subplots_adjust(top=0.88, bottom=0.10, hspace=0.35)
+    fig.subplots_adjust(top=0.80, bottom=0.10, hspace=0.35)
 
     out_path = output_dir / f"{plot_name}_quad_view.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
@@ -973,6 +1230,7 @@ def _quad_phase_boxplots(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     metrics = [
         ("gpu_util_percent", "GPU Util (%)"),
@@ -993,7 +1251,7 @@ def _quad_phase_boxplots(
         return out_path
 
     frames: List[pd.DataFrame] = []
-    run_meta: List[Tuple[str, Optional[int], str]] = []
+    run_meta: List[Tuple[str, Optional[int], str, str]] = []
     for run in runs:
         df = run.annotated_df
         if "phase_name" not in df.columns:
@@ -1007,7 +1265,7 @@ def _quad_phase_boxplots(
         df["algo_label"] = algo_label
         df["gpu_count"] = gpu_count
         frames.append(df)
-        run_meta.append((algo_label, gpu_count, label))
+        run_meta.append((algo_label, gpu_count, label, run.run_name))
 
     apply_theme(theme)
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
@@ -1029,47 +1287,40 @@ def _quad_phase_boxplots(
     phases = [p for p in preferred_phases if p in phases_set]
     phases.extend(sorted(p for p in phases_set if p not in phases))
 
-    run_labels = [label for _, _, label in run_meta]
-    remax_labels = {label for algo_label, _, label in run_meta if algo_label == "ReMax"}
+    if run_meta:
+        order = sorted(
+            range(len(run_meta)),
+            key=lambda i: _legend_sort_key(run_meta[i][3], run_meta[i][2], run_meta[i][1]),
+        )
+        run_meta = [run_meta[i] for i in order]
 
-    algo_cmaps = {
-        "PPO": "Blues",
-        "ReMax": "Oranges",
-        "DPO": "Greens",
-        "SFT": "Purples",
+    run_labels = [label for _, _, label, _ in run_meta]
+    algo_hatches = {
+        "ReMax": ".",
     }
-
-    algo_gpu_counts: Dict[str, List[int]] = {}
-    for algo_label, gpu_count, _ in run_meta:
-        if gpu_count is not None:
-            algo_gpu_counts.setdefault(algo_label, []).append(gpu_count)
-
-    algo_color_map: Dict[Tuple[str, int], Tuple[float, float, float, float]] = {}
-    for algo_label, counts in algo_gpu_counts.items():
-        unique_counts = sorted(set(counts))
-        if not unique_counts:
-            continue
-        cmap_name = algo_cmaps.get(algo_label, "Greys")
-        cmap = plt.get_cmap(cmap_name)
-        if len(unique_counts) == 1:
-            algo_color_map[(algo_label, unique_counts[0])] = cmap(0.65)
-            continue
-        for idx, count in enumerate(unique_counts):
-            frac = idx / (len(unique_counts) - 1)
-            shade = 0.35 + 0.5 * frac
-            algo_color_map[(algo_label, count)] = cmap(shade)
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [(algo_label, gpu_count) for algo_label, gpu_count, _, _ in run_meta],
+        algo_cmaps,
+    )
 
     unknown_color = "#7f8c8d"
     palette: Dict[str, Tuple[float, float, float, float]] = {}
-    for algo_label, gpu_count, label in run_meta:
-        color = (
-            algo_color_map.get((algo_label, gpu_count))
-            if gpu_count is not None
-            else None
+    label_to_hatch: Dict[str, str] = {}
+    for algo_label, gpu_count, label, run_name in run_meta:
+        color, hatch, _ = _resolve_run_style(
+            run_name=run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_hatches=algo_hatches,
+            plot_name=PhaseBoxplotPlotter.plot_name,
         )
-        if color is None:
-            color = unknown_color
         palette[label] = color
+        label_to_hatch[label] = hatch
 
     y_bounds: Dict[str, Optional[Tuple[float, float]]] = {metric: None for metric, _ in metrics}
     for metric, _ in metrics:
@@ -1134,31 +1385,34 @@ def _quad_phase_boxplots(
 
             for patch in box_patches:
                 run_label = _closest_label(patch.get_facecolor())
-                patch.set_hatch("." if run_label in remax_labels else "")
+                patch.set_hatch(label_to_hatch.get(run_label, ""))
                 patch.set_edgecolor("#2c3e50")
                 patch.set_linewidth(0.6)
 
     legend_handles = []
-    for algo_label, gpu_count, label in run_meta:
-        color = (
-            algo_color_map.get((algo_label, gpu_count))
-            if gpu_count is not None
-            else None
+    for algo_label, gpu_count, label, run_name in run_meta:
+        color, hatch, _ = _resolve_run_style(
+            run_name=run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_hatches=algo_hatches,
+            plot_name=PhaseBoxplotPlotter.plot_name,
         )
-        if color is None:
-            color = unknown_color
-        hatch = "." if label in remax_labels else ""
         legend_handles.append(Patch(facecolor=color, edgecolor="#2c3e50", hatch=hatch, label=label))
 
     fig.suptitle("Phase Boxplots (Grouped by Run)", fontsize=12, fontweight="bold", y=0.98)
     fig.legend(
         handles=legend_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.93),
+        bbox_to_anchor=(0.5, 0.955),
         ncol=min(4, len(legend_handles)),
         frameon=False,
     )
-    fig.subplots_adjust(top=0.88, bottom=0.12, hspace=0.35, wspace=0.25)
+    fig.subplots_adjust(top=0.80, bottom=0.12, hspace=0.35, wspace=0.25)
 
     out_path = output_dir / f"{PhaseBoxplotPlotter.plot_name}_quad_view.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
@@ -1482,6 +1736,7 @@ def _quad_throughput_vs_length(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     x_bounds = _bounds_for_column(runs, "merged_df", "data.global_seqlen/mean")
     y_bounds = _bounds_for_column(runs, "merged_df", "data.perf/throughput")
@@ -1504,6 +1759,14 @@ def _quad_throughput_vs_length(
     out_path = output_dir / f"{ThroughputVsLengthPlotter.plot_name}_quad_view.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
     plt.close(fig)
+    _combined_throughput_vs_length(
+        runs,
+        output_dir,
+        theme,
+        x_bounds,
+        y_bounds,
+        style_config=style_config,
+    )
     return out_path
 
 
@@ -1511,6 +1774,7 @@ def _quad_throughput_reward_frontier(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     x_bounds = _bounds_for_column(
         runs,
@@ -1535,6 +1799,206 @@ def _quad_throughput_reward_frontier(
         _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
 
     out_path = output_dir / f"{ThroughputRewardFrontierPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    _combined_throughput_reward_frontier(
+        runs,
+        output_dir,
+        theme,
+        x_bounds,
+        y_bounds,
+        style_config=style_config,
+    )
+    return out_path
+
+
+def _combined_throughput_vs_length(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    x_bounds: Optional[Tuple[float, float]],
+    y_bounds: Optional[Tuple[float, float]],
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, ax = plt.subplots(1, 1, figsize=(7.6, 5.1))
+
+    algo_linestyles = {
+        "PPO": "-",
+        "ReMax": (0, (6, 4)),
+        "GRPO": (0, (6, 4)),
+        "DPO": (0, (5, 2, 1, 2)),
+        "SFT": (0, (1, 6)),
+    }
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [_extract_algo_and_gpu(run.run_name) for run in runs],
+        algo_cmaps,
+    )
+    unknown_color = "#7f8c8d"
+
+    ordered_runs = sorted(
+        runs,
+        key=lambda run: _legend_sort_key(run.run_name, get_clean_label(run.run_name)),
+    )
+    plotted = 0
+    for run in ordered_runs:
+        df = run.merged_df
+        if df is None:
+            continue
+        if "data.global_seqlen/mean" not in df.columns or "data.perf/throughput" not in df.columns:
+            continue
+        x_vals = pd.to_numeric(df["data.global_seqlen/mean"], errors="coerce")
+        y_vals = pd.to_numeric(df["data.perf/throughput"], errors="coerce")
+        mask = x_vals.notna() & y_vals.notna()
+        if mask.sum() < 2:
+            continue
+        x = x_vals[mask].to_numpy()
+        y = y_vals[mask].to_numpy()
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+
+        coeffs = np.polyfit(x, y, deg=1)
+        fit_x = np.linspace(x.min(), x.max(), 100)
+        fit_y = coeffs[0] * fit_x + coeffs[1]
+
+        label = get_clean_label(run.run_name)
+        algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
+        color, _, linestyle = _resolve_run_style(
+            run_name=run.run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_linestyles=algo_linestyles,
+            plot_name=ThroughputVsLengthPlotter.plot_name,
+        )
+        ax.plot(
+            fit_x,
+            fit_y,
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.8,
+            alpha=0.9,
+            label=label,
+        )
+        plotted += 1
+
+    if plotted == 0:
+        ax.set_title("Throughput vs Length (missing data)")
+    else:
+        ax.set_title("Throughput vs Length (Best-Fit Lines)")
+        ax.legend(loc="best", fontsize=QUAD_TICK_SIZE)
+
+    ax.set_xlabel("Sequence Length (mean)")
+    ax.set_ylabel("Throughput (tokens/s)")
+    ax.grid(True, alpha=theme.grid_alpha)
+    _apply_limits(ax, x_bounds, y_bounds)
+    fig.tight_layout()
+
+    out_path = output_dir / f"{ThroughputVsLengthPlotter.plot_name}_all_runs.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _combined_throughput_reward_frontier(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    x_bounds: Optional[Tuple[float, float]],
+    y_bounds: Optional[Tuple[float, float]],
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, ax = plt.subplots(1, 1, figsize=(7.6, 5.1))
+
+    algo_linestyles = {
+        "PPO": "-",
+        "ReMax": (0, (6, 4)),
+        "GRPO": (0, (6, 4)),
+        "DPO": (0, (5, 2, 1, 2)),
+        "SFT": (0, (1, 6)),
+    }
+    algo_markers = {
+        "PPO": "o",
+        "ReMax": "s",
+        "GRPO": "^",
+        "DPO": "D",
+        "SFT": "v",
+    }
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [_extract_algo_and_gpu(run.run_name) for run in runs],
+        algo_cmaps,
+    )
+    unknown_color = "#7f8c8d"
+
+    ordered_runs = sorted(
+        runs,
+        key=lambda run: _legend_sort_key(run.run_name, get_clean_label(run.run_name)),
+    )
+    plotted = 0
+    for run in ordered_runs:
+        df = run.merged_df
+        if df is None:
+            continue
+        if "data.val-core/openai/gsm8k/reward/mean@1" not in df.columns or "data.perf/throughput" not in df.columns:
+            continue
+        x_vals = pd.to_numeric(df["data.val-core/openai/gsm8k/reward/mean@1"], errors="coerce")
+        y_vals = pd.to_numeric(df["data.perf/throughput"], errors="coerce")
+        mask = x_vals.notna() & y_vals.notna()
+        if mask.sum() == 0:
+            continue
+        label = get_clean_label(run.run_name)
+        algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
+        color, _, linestyle = _resolve_run_style(
+            run_name=run.run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_linestyles=algo_linestyles,
+            plot_name=ThroughputRewardFrontierPlotter.plot_name,
+        )
+        marker = algo_markers.get(algo_label, "o")
+        ax.scatter(
+            x_vals[mask],
+            y_vals[mask],
+            color=color,
+            alpha=0.55,
+            s=18,
+            marker=marker,
+        )
+        ax.plot(
+            x_vals[mask],
+            y_vals[mask],
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.2,
+            alpha=0.85,
+            label=label,
+        )
+        plotted += 1
+
+    if plotted == 0:
+        ax.set_title("Throughput vs Reward (missing data)")
+    else:
+        ax.set_title("Throughput vs Reward (All Runs)")
+        ax.legend(loc="best", fontsize=QUAD_TICK_SIZE)
+
+    ax.set_xlabel("Reward")
+    ax.set_ylabel("Throughput (tokens/s)")
+    ax.grid(True, alpha=theme.grid_alpha)
+    _apply_limits(ax, x_bounds, y_bounds)
+    fig.tight_layout()
+
+    out_path = output_dir / f"{ThroughputRewardFrontierPlotter.plot_name}_all_runs.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
     plt.close(fig)
     return out_path
@@ -1592,6 +2056,7 @@ def _quad_learning_price(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> Optional[Path]:
     x_bounds = None
     y_bounds = None
@@ -1615,39 +2080,20 @@ def _quad_learning_price(
         "SFT": (0, (1, 6)),
     }
 
-    algo_cmaps = {
-        "PPO": "Blues",
-        "ReMax": "Oranges",
-        "DPO": "Greens",
-        "SFT": "Purples",
-    }
-
-    algo_gpu_counts: Dict[str, List[int]] = {}
-    for run in runs:
-        algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
-        if gpu_count is None:
-            continue
-        algo_gpu_counts.setdefault(algo_label, []).append(gpu_count)
-
-    algo_color_map: Dict[Tuple[str, int], Tuple[float, float, float, float]] = {}
-    for algo_label, counts in algo_gpu_counts.items():
-        unique_counts = sorted(set(counts))
-        if not unique_counts:
-            continue
-        cmap_name = algo_cmaps.get(algo_label, "Greys")
-        cmap = plt.get_cmap(cmap_name)
-        if len(unique_counts) == 1:
-            algo_color_map[(algo_label, unique_counts[0])] = cmap(0.65)
-            continue
-        for idx, count in enumerate(unique_counts):
-            frac = idx / (len(unique_counts) - 1)
-            shade = 0.35 + 0.5 * frac
-            algo_color_map[(algo_label, count)] = cmap(shade)
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [_extract_algo_and_gpu(run.run_name) for run in runs],
+        algo_cmaps,
+    )
 
     unknown_color = "#7f8c8d"
 
     plotted = 0
-    for run in runs:
+    ordered_runs = sorted(
+        runs,
+        key=lambda run: _legend_sort_key(run.run_name, get_clean_label(run.run_name)),
+    )
+    for run in ordered_runs:
         df = run.merged_df
         if df is None:
             continue
@@ -1660,14 +2106,17 @@ def _quad_learning_price(
         order = np.argsort(x)
         label = get_clean_label(run.run_name)
         algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
-        linestyle = algo_linestyles.get(algo_label, "-")
-        color = (
-            algo_color_map.get((algo_label, gpu_count))
-            if gpu_count is not None
-            else None
+        color, _, linestyle = _resolve_run_style(
+            run_name=run.run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_linestyles=algo_linestyles,
+            plot_name=LearningPricePlotter.plot_name,
         )
-        if color is None:
-            color = unknown_color
         ax.plot(x[order], y[order], linewidth=1.2, alpha=0.9, label=label, linestyle=linestyle, color=color)
         plotted += 1
 
@@ -1736,26 +2185,51 @@ def _quad_bottleneck_evolution(
     output_dir: Path,
     theme: ThemeConfig,
 ) -> Optional[Path]:
-    max_val = None
-    reward_col = "data.val-core/openai/gsm8k/reward/mean@1"
-    for run in runs:
-        df = run.merged_df
-        if df is None or reward_col not in df.columns:
-            continue
+    def _bottleneck_bounds(df: pd.DataFrame) -> Optional[Tuple[float, float]]:
+        reward_col = "data.val-core/openai/gsm8k/reward/mean@1"
         timing_cols = [c for c in df.columns if c.startswith("data.timing_per_token_ms/")]
         if not timing_cols:
-            continue
-        reward = pd.to_numeric(df[reward_col], errors="coerce")
-        early_mask = reward < 0.1
-        mature_mask = reward > 0.4
-        if early_mask.sum() == 0 or mature_mask.sum() == 0:
-            continue
+            return None
+
+        reward = None
+        early_mask = None
+        mature_mask = None
+
+        if reward_col in df.columns:
+            reward = pd.to_numeric(df[reward_col], errors="coerce")
+            finite_reward = reward.dropna()
+            if not finite_reward.empty:
+                q_low = float(finite_reward.quantile(0.2))
+                q_high = float(finite_reward.quantile(0.8))
+                if q_low < q_high:
+                    early_mask = reward <= q_low
+                    mature_mask = reward >= q_high
+
+        if early_mask is None or mature_mask is None or early_mask.sum() == 0 or mature_mask.sum() == 0:
+            if "step" not in df.columns:
+                return None
+            steps = pd.to_numeric(df["step"], errors="coerce")
+            finite_steps = steps.dropna()
+            if finite_steps.empty:
+                return None
+            s_low = float(finite_steps.quantile(0.2))
+            s_high = float(finite_steps.quantile(0.8))
+            early_mask = steps <= s_low
+            mature_mask = steps >= s_high
+
         values = []
         for col in timing_cols:
             early_mean = pd.to_numeric(df.loc[early_mask, col], errors="coerce").mean()
             mature_mean = pd.to_numeric(df.loc[mature_mask, col], errors="coerce").mean()
             values.extend([early_mean, mature_mean])
-        bounds = _finite_min_max(values)
+        return _finite_min_max(values)
+
+    max_val = None
+    for run in runs:
+        df = run.merged_df
+        if df is None:
+            continue
+        bounds = _bottleneck_bounds(df)
         if bounds is not None:
             max_val = max_val if max_val is not None else bounds[1]
             max_val = max(max_val, bounds[1])
@@ -1855,10 +2329,10 @@ def _quad_operation_comparison(
     y_bounds = {metric: _pad_bounds(bounds) for metric, bounds in y_bounds.items()}
 
     apply_theme(theme)
-    fig, outer = _create_quad_figure((18, 12))
+    fig, outer = _create_quad_figure((16, 10))
     axes_list = []
     for idx, run in enumerate(runs):
-        axes = _make_inner_axes(fig, outer, idx, 2, 3)
+        axes = _make_inner_axes(fig, outer, idx, 2, 2)
         plotter = OperationComparisonPlotter(run, output_dir, theme)
         plotter.draw(fig, axes)
         flat_axes = np.ravel(axes)
@@ -1873,6 +2347,80 @@ def _quad_operation_comparison(
     out_path = output_dir / f"{OperationComparisonPlotter.plot_name}_quad_view.png"
     fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
     plt.close(fig)
+
+    for metric, label in metrics:
+        _quad_operation_comparison_metric(
+            runs,
+            output_dir,
+            theme,
+            metric,
+            label,
+            y_bounds.get(metric),
+        )
+    return out_path
+
+
+def _quad_operation_comparison_metric(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    metric: str,
+    label: str,
+    y_bounds: Optional[Tuple[float, float]],
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((12, 7))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        ax = np.ravel(axes)[0]
+        df = run.annotated_df
+        if df is None or "operation" not in df.columns:
+            ax.set_title("Missing operation data.")
+            axes_list.append(axes)
+            continue
+        df = df.copy()
+        df["operation"] = df["operation"].fillna("unknown").astype(str)
+        df = df[~df["operation"].isin(EXCLUDED_OPERATIONS)]
+        if df.empty or metric not in df.columns:
+            ax.set_title(f"{label} (missing data)")
+            axes_list.append(axes)
+            continue
+        if sns is None:
+            ax.set_title("Seaborn not available for boxplots.")
+            axes_list.append(axes)
+            continue
+
+        unique_ops = df["operation"].unique()
+        palette = [OPERATION_COLORS.get(op, OPERATION_COLORS["unknown"]) for op in unique_ops]
+        sns.boxplot(
+            data=df,
+            x="operation",
+            y=metric,
+            hue="operation",
+            legend=False,
+            ax=ax,
+            palette=palette,
+        )
+        ax.set_xlabel("")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, axis="y", alpha=theme.grid_alpha)
+        ax.tick_params(axis="x", labelrotation=45)
+        for label_text in ax.get_xticklabels():
+            label_text.set_ha("right")
+            label_text.set_fontsize(8)
+        _apply_limits(ax, None, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    safe_name = metric.replace("/", "_").replace(".", "_")
+    out_path = output_dir / f"{OperationComparisonPlotter.plot_name}_{safe_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
     return out_path
 
 
@@ -1881,14 +2429,14 @@ def _quad_plotters() -> Mapping[str, callable]:
         GPUOverviewPlotter.plot_name: _quad_gpu_overview,
         PhaseTimelinePlotter.plot_name: _quad_phase_timeline,
         PhaseAggregatePlotter.plot_name: _quad_phase_aggregate,
-        PhaseFocusRolloutPlotter.plot_name: lambda runs, out, theme: _quad_phase_focus(
-            runs, out, theme, PhaseFocusRolloutPlotter, PhaseFocusRolloutPlotter.plot_name
+        PhaseFocusRolloutPlotter.plot_name: lambda runs, out, theme, style_config=None: _quad_phase_focus(
+            runs, out, theme, PhaseFocusRolloutPlotter, PhaseFocusRolloutPlotter.plot_name, style_config
         ),
-        PhaseFocusRLPolicyPlotter.plot_name: lambda runs, out, theme: _quad_phase_focus(
-            runs, out, theme, PhaseFocusRLPolicyPlotter, PhaseFocusRLPolicyPlotter.plot_name
+        PhaseFocusRLPolicyPlotter.plot_name: lambda runs, out, theme, style_config=None: _quad_phase_focus(
+            runs, out, theme, PhaseFocusRLPolicyPlotter, PhaseFocusRLPolicyPlotter.plot_name, style_config
         ),
-        PhaseFocusTrainingPlotter.plot_name: lambda runs, out, theme: _quad_phase_focus(
-            runs, out, theme, PhaseFocusTrainingPlotter, PhaseFocusTrainingPlotter.plot_name
+        PhaseFocusTrainingPlotter.plot_name: lambda runs, out, theme, style_config=None: _quad_phase_focus(
+            runs, out, theme, PhaseFocusTrainingPlotter, PhaseFocusTrainingPlotter.plot_name, style_config
         ),
         PhaseEnergyTimeStackedPlotter.plot_name: _quad_phase_energy_time_stacked,
         PhaseBoxplotPlotter.plot_name: _quad_phase_boxplots,
@@ -1916,14 +2464,14 @@ def generate_quad_views(
     output_dir: Path,
     plotter_classes: Optional[Mapping[str, type]] = None,
     theme: Optional[ThemeConfig] = None,
+    style_config: Optional[RunStyleConfig] = None,
 ) -> List[Path]:
-    """Generate quad-view comparisons for the first four runs."""
-    run_list = list(runs)
-    if len(run_list) < 4:
-        print("Quad views skipped: need at least 4 runs.")
+    """Generate quad-view comparisons for the available runs."""
+    run_list = sorted(list(runs), key=_quad_run_sort_key)
+    if not run_list:
+        print("Quad views skipped: no runs available.")
         return []
 
-    run_list = run_list[:4]
     out_dir = Path(output_dir) / "quad_plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     theme = theme or ThemeConfig()
@@ -1932,16 +2480,26 @@ def generate_quad_views(
     if plotter_classes:
         available_plot_names = {cls.plot_name for cls in plotter_classes.values()}
 
+    global _QUAD_GRID_SHAPE
+    prev_shape = _QUAD_GRID_SHAPE
+    _QUAD_GRID_SHAPE = _grid_dims(len(run_list))
+
     outputs: List[Path] = []
-    for plot_name, handler in _quad_plotters().items():
-        if available_plot_names is not None and plot_name not in available_plot_names:
-            continue
-        try:
-            out_path = handler(run_list, out_dir, theme)
-        except Exception as exc:  # pragma: no cover
-            print(f"Quad view failed for {plot_name}: {exc}")
-            continue
-        if out_path is not None:
-            outputs.append(out_path)
+    try:
+        for plot_name, handler in _quad_plotters().items():
+            if available_plot_names is not None and plot_name not in available_plot_names:
+                continue
+            try:
+                if style_config is not None and "style_config" in inspect.signature(handler).parameters:
+                    out_path = handler(run_list, out_dir, theme, style_config)
+                else:
+                    out_path = handler(run_list, out_dir, theme)
+            except Exception as exc:  # pragma: no cover
+                print(f"Quad view failed for {plot_name}: {exc}")
+                continue
+            if out_path is not None:
+                outputs.append(out_path)
+    finally:
+        _QUAD_GRID_SHAPE = prev_shape
 
     return outputs
