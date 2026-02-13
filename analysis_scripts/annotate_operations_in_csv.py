@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Heuristically annotate phased GPU CSV rows with operation labels.
 
-This script operates only on monitoring_small_cleaned. For each run folder, it:
+This script operates on a cleaned folder. For each run folder, it:
 1) Filters out idle rows from the phased CSV.
 2) Aligns CSV wall-clock timestamps to cleaned phase timing timestamps
    using the first non-idle (iteration, phase) anchor.
@@ -14,6 +14,7 @@ Outputs an annotated CSV next to the original within each run folder.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 from dataclasses import dataclass
@@ -21,8 +22,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-# Top-level constant (easy to change)
-CLEANED_FOLDER = "monitoring_small_cleaned"
+# Default repo root (do not depend on current working directory)
+DEFAULT_ROOT = Path("/home/cathxhou/projects/verl_research")
+# Default cleaned folder name (used when no name/dir args are provided)
+DEFAULT_CLEANED_DIR = "monitoring_small_cleaned"
 
 # Phase-specific operation ordering for proportional slicing
 PHASE_OPERATION_ORDER: Dict[str, List[str]] = {
@@ -222,48 +225,99 @@ def annotate_run(run_dir: Path) -> Tuple[int, int, int]:
     ]
     out_fieldnames = fieldnames + [c for c in extra_cols if c not in fieldnames]
 
+    annotated_rows: List[Dict[str, str]] = []
+    gpu_ids: set[str] = set()
+
+    for row in rows:
+        if row.get("phase_name") == "idle":
+            continue
+        try:
+            iteration = int(row.get("iteration", "0"))
+        except ValueError:
+            continue
+        if iteration <= 0:
+            continue
+
+        kept_rows += 1
+        phase = row.get("phase_name", "")
+        key = (iteration, phase)
+        window = windows.get(key)
+        timing = phase_map.get(key)
+
+        aligned_ts = parse_csv_timestamp(row["timestamp"]) + offset
+        row["timestamp_aligned_unix"] = f"{aligned_ts:.6f}"
+
+        if window and timing:
+            start, end = window
+            slices = operation_slices(phase, timing.operations, start, end)
+            op = assign_operation(aligned_ts, slices)
+            row["operation"] = op
+            tagged_rows += 1
+        else:
+            row["operation"] = "unknown"
+
+        gpu_id = str(row.get("gpu_id", "")).strip()
+        if gpu_id:
+            gpu_ids.add(gpu_id)
+        annotated_rows.append(row)
+
     out_path = run_dir / f"annotated_{csv_path.name}"
     with out_path.open("w", newline="") as f_out:
         writer = csv.DictWriter(f_out, fieldnames=out_fieldnames)
         writer.writeheader()
-
-        for row in rows:
-            if row.get("phase_name") == "idle":
-                continue
-            try:
-                iteration = int(row.get("iteration", "0"))
-            except ValueError:
-                continue
-            if iteration <= 0:
-                continue
-
-            kept_rows += 1
-            phase = row.get("phase_name", "")
-            key = (iteration, phase)
-            window = windows.get(key)
-            timing = phase_map.get(key)
-
-            aligned_ts = parse_csv_timestamp(row["timestamp"]) + offset
-            row["timestamp_aligned_unix"] = f"{aligned_ts:.6f}"
-
-            if window and timing:
-                start, end = window
-                slices = operation_slices(phase, timing.operations, start, end)
-                op = assign_operation(aligned_ts, slices)
-                row["operation"] = op
-                tagged_rows += 1
-            else:
-                row["operation"] = "unknown"
-
+        for row in annotated_rows:
             writer.writerow(row)
+
+    if len(gpu_ids) > 1:
+        def _safe_gpu_id(raw: str) -> str:
+            return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in raw)
+
+        for gpu_id in sorted(gpu_ids):
+            suffix = _safe_gpu_id(gpu_id)
+            gpu_out = run_dir / f"annotated_{csv_path.stem}_gpu{suffix}.csv"
+            with gpu_out.open("w", newline="") as f_out:
+                writer = csv.DictWriter(f_out, fieldnames=out_fieldnames)
+                writer.writeheader()
+                for row in annotated_rows:
+                    if str(row.get("gpu_id", "")).strip() == gpu_id:
+                        writer.writerow(row)
 
     return (kept_rows, tagged_rows, len(rows))
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Annotate phased CSV rows with operation labels."
+    )
+    parser.add_argument(
+        "--root",
+        default=str(DEFAULT_ROOT),
+        help="Repo root containing monitoring folders (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--name",
+        help="Base folder name. Uses <name>_cleaned under --root.",
+    )
+    parser.add_argument(
+        "--cleaned-dir",
+        help="Explicit cleaned directory (absolute or relative to --root).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    script_dir = Path(__file__).parent.resolve()
-    project_root = script_dir.parent
-    cleaned_root = project_root / CLEANED_FOLDER
+    args = parse_args()
+    if args.name is None and args.cleaned_dir is None:
+        print("❌ Please provide --name or --cleaned-dir to avoid operating on the wrong dataset.")
+        return
+    root = Path(args.root).expanduser().resolve()
+    if args.cleaned_dir:
+        cleaned_root = Path(args.cleaned_dir).expanduser()
+        cleaned_root = cleaned_root if cleaned_root.is_absolute() else root / cleaned_root
+    elif args.name:
+        cleaned_root = root / f"{args.name}_cleaned"
+    else:
+        cleaned_root = root / DEFAULT_CLEANED_DIR
 
     if not cleaned_root.exists():
         print(f"❌ CLEANED_FOLDER does not exist: {cleaned_root}")
