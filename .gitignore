@@ -9,13 +9,49 @@
 **/playground
 **/wandb
 
+# research additions
 verl-env/
-outputs
-logs
+outputs/
+logs/
 analysis_output
 per_phase_analysis
 per_subphase_analysis*
-monitoring/
+
+plots/
+
+# live folder for runs
+monitoring_val/
+
+# hoarding data
+monitoring_backup/
+monitoring_llama_qwen_TRASH
+
+
+# large model runs
+monitoring_large_1_epoch/
+
+# small model runs
+monitoring_small_3_epochs/
+monitoring_small_cleaned/
+monitoring_small_data/
+monitoring_small_val/
+monitoring_val_backup/
+
+# NO NO API KEY
+profiling_scripts/token.sh
+profiling_scripts/token.txt
+
+# plots
+plots_small/
+!plots_small/
+plots_small/*
+
+# Ignore everything in plots_llama_qwen
+plots_llama_qwen/**
+# Re-include the quad_plots folder + everything inside it
+!plots_llama_qwen/quad_plots/
+!plots_llama_qwen/quad_plots/**
+plots_backup/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

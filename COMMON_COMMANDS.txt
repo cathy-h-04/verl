@@ -1,0 +1,53 @@
+
+
+[START SESSIION]
+tmux new -s overnight
+
+
+[RUN SCRIPT]
+EPOCHS=1 \
+POLL_INTERVAL=1 \
+GRANULARITY=operation \
+DATASET_NAME=gsm8k \
+USE_VALIDATION=0 \
+bash profiling_scripts/policy_size_model_nnodes.sh
+
+[DETTACH] -> another shell
+tmux detach-client
+
+
+[REATTACH LATER]
+tmux attach -t overnight
+
+
+[KILL SESSION]
+tmux kill-session -t overnight
+
+
+[MANUAL FOR ALL COMMANDS]
+nvidia-smi --help-query-gpu | less
+nvidia-smi --help-query-gpu | grep -i -C 3 "memory.total" | less
+
+
+
+
+
+------------------------------------
+[RESOURCES]
+nvidia-smi
+
+[CHECK USER]
+ps -fp <PID>
+-------------------------------------
+
+python analysis_scripts/data_cleanup.py --name monitoring_llama_qwen
+python analysis_scripts/merge_val_metrics.py --name monitoring_llama_qwen
+python analysis_scripts/jsonl_to_csv.py --name monitoring_llama_qwen
+python analysis_scripts/annotate_operations_in_csv.py --name monitoring_llama_qwen
+
+
+[RUN ENTIRE DATA CLEANING PIPELINE]
+python analysis_scripts/pipeline/main.py --name monitoring_llama_qwen
+
+[GRAPH INTO PLOTS]
+python analysis_scripts/graphing/main.py --name monitoring_llama_qwen
