@@ -30,6 +30,7 @@ GPU_MEMORY_UTIL=0.30
 ROLLOUT_MAX_BATCHED_TOKENS=1536
 ROLLOUT_MAX_MODEL_LEN=1024
 ROLLOUT_MAX_NUM_SEQS=64
+ROLLOUT_N=4
 ENABLE_GRAD_CHECKPOINTING=true
 
 # -------------------- Environment Setup --------------------
@@ -120,8 +121,13 @@ case "$POLICY" in
     remax)
         POLICY_ARGS+=("algorithm.adv_estimator=remax")
         ;;
+    grpo)
+        POLICY_ARGS+=("algorithm.adv_estimator=grpo")
+        POLICY_ARGS+=("algorithm.use_kl_in_reward=False")
+        POLICY_ARGS+=("actor_rollout_ref.actor.use_kl_loss=False")
+        ;;
     *)
-        echo "ERROR: Unsupported policy '$POLICY' (use ppo or remax)"
+        echo "ERROR: Unsupported policy '$POLICY' (use ppo, remax, or grpo)"
         exit 1
         ;;
 esac
@@ -145,6 +151,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.enable_chunked_prefill=False \
   actor_rollout_ref.rollout.max_model_len=$ROLLOUT_MAX_MODEL_LEN \
   actor_rollout_ref.rollout.max_num_seqs=$ROLLOUT_MAX_NUM_SEQS \
+  actor_rollout_ref.rollout.n=$ROLLOUT_N \
   actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL_SIZE \
   actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTIL \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE_PER_GPU \

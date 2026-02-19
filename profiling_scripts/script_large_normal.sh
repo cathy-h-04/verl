@@ -5,7 +5,7 @@
 #
 
 source ~/projects/verl_research/verl-env/bin/activate
-set -o pipefail
+set -euo pipefail
 
 
 PROJECT_DIR="/home/cathxhou/projects/verl_research"
@@ -13,11 +13,10 @@ PROFILING_DIR="${PROJECT_DIR}/profiling_scripts"
 
 TOKEN_SCRIPT="${PROFILING_DIR}/token.sh"
 if [ -f "$TOKEN_SCRIPT" ]; then
-    if ! bash "$TOKEN_SCRIPT"; then
-        echo "WARNING: token script failed: $TOKEN_SCRIPT (continuing)"
-    fi
+    bash "$TOKEN_SCRIPT"
 else
-    echo "WARNING: token script not found: $TOKEN_SCRIPT (continuing)"
+    echo "ERROR: token script not found: $TOKEN_SCRIPT"
+    exit 1
 fi
 
 BASE_EXPERIMENT_PREFIX="${BASE_EXPERIMENT_PREFIX:-sweep}"
@@ -30,19 +29,23 @@ USE_VALIDATION="${USE_VALIDATION:-0}"
 
 # Model IDs (override as needed).
 QWEN_SMALL="${QWEN_SMALL:-Qwen/Qwen2.5-1.5B-Instruct}"
+QWEN_MEDIUM="${QWEN_MEDIUM:-Qwen/Qwen2.5-1.5B-Instruct}"
 QWEN_LARGE="${QWEN_LARGE:-Qwen/Qwen2.5-3B-Instruct}"
-LLAMA_LARGE="${LLAMA_LARGE:-meta-llama/Llama-3.1-8B-Instruct}"
+LLAMA_SMALL="${LLAMA_SMALL:-meta-llama/Llama-3.1-8B-Instruct}"
+LLAMA_LARGE="${LLAMA_LARGE:-meta-llama/Llama-3.1-70B-Instruct}"
+MISTRAL_SMALL="${MISTRAL_SMALL:-mistralai/Mistral-7B-Instruct-v0.3}"
+MISTRAL_LARGE="${MISTRAL_LARGE:-mistralai/Mistral-7B-Instruct-v0.3}"
 
 # MODELS=("qwen2.5" "llama3.1" "mistral")
 # SIZES=("small" "medium" "large")
 # N_GPUS_PER_NODE_LIST=("1" "2")
 # POLICIES=("ppo" "remax")
 
-MODELS=("llama3.1" "qwen2.5")
+MODELS=("qwen2.5")
 SIZES=("large")
-N_GPUS_PER_NODE_LIST=("2")
+N_GPUS_PER_NODE_LIST=("1" "2")
 echo "using $N_GPUS_PER_NODE_LIST total nodes"
-POLICIES=("ppo" "remax" "grpo")
+POLICIES=("ppo" "remax")
 
 for model in "${MODELS[@]}"; do
     for size in "${SIZES[@]}"; do
@@ -55,13 +58,17 @@ for model in "${MODELS[@]}"; do
             mistral_small) MODEL_NAME="$MISTRAL_SMALL" ;;
             mistral_large) MODEL_NAME="$MISTRAL_LARGE" ;;
             *)
-                echo "WARNING: Unknown model/size combo ${model}_${size}. Skipping."
-                continue
+                echo "ERROR: Unknown model/size combo ${model}_${size}"
+                exit 1
                 ;;
         esac
 
         for n_gpus_per_node in "${N_GPUS_PER_NODE_LIST[@]}"; do
             for policy in "${POLICIES[@]}"; do
+                if [ "$size" = "medium" ] && [ "$policy" = "ppo" ] && [ "$n_gpus_per_node" = "1" ]; then
+                    echo "Skipping ${model}_${size} ${policy} ${n_gpus_per_node}gpn (already collected)."
+                    continue
+                fi
                 TRAIN_SCRIPT="run_verl_train_nonval.sh"
                 case "$USE_VALIDATION" in
                     1|true|TRUE|yes|YES)
