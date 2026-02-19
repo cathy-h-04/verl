@@ -261,6 +261,126 @@ class PhaseFocusTrainingPlotter(PhaseFocusMetricsPlotter):
     focus_phase = "training"
 
 
+def build_phase_metric_timeseries(
+    df: pd.DataFrame,
+    metric: str,
+    use_time_axis: bool = True,
+) -> Tuple[pd.DataFrame, str, str]:
+    """Aggregate metric by iteration + phase over full run."""
+    if df is None or df.empty or "phase_name" not in df.columns:
+        return pd.DataFrame(), "iteration", "Iteration"
+
+    work = df.copy()
+    work = work[work["phase_name"] != "idle"]
+    work["iteration"] = pd.to_numeric(work.get("iteration"), errors="coerce")
+    work = work.dropna(subset=["iteration"])
+    if work.empty:
+        return pd.DataFrame(), "iteration", "Iteration"
+
+    if use_time_axis and "timestamp_aligned_unix" in work.columns:
+        time_raw = pd.to_numeric(work["timestamp_aligned_unix"], errors="coerce")
+        time_ref = time_raw.min()
+        work["time_min"] = (time_raw - time_ref) / 60.0
+        x_col = "time_min"
+        x_label = "Time (minutes)"
+    elif use_time_axis and "elapsed_seconds" in work.columns:
+        time_raw = pd.to_numeric(work["elapsed_seconds"], errors="coerce")
+        time_ref = time_raw.min()
+        work["time_min"] = (time_raw - time_ref) / 60.0
+        x_col = "time_min"
+        x_label = "Time (minutes)"
+    else:
+        x_col = "iteration"
+        x_label = "Iteration"
+
+    if metric not in work.columns:
+        return pd.DataFrame(), x_col, x_label
+
+    work[metric] = pd.to_numeric(work[metric], errors="coerce")
+    work = work.dropna(subset=[metric, x_col])
+    if work.empty:
+        return pd.DataFrame(), x_col, x_label
+
+    agg_map = {metric: "mean", x_col: "mean"}
+    grouped = work.groupby(["iteration", "phase_name"], dropna=False).agg(agg_map)
+    grouped = grouped.reset_index()
+    grouped["phase_name"] = grouped["phase_name"].fillna("unknown").astype(str)
+    return grouped, x_col, x_label
+
+
+class PhaseAggregateMetricsPlotter(BasePlotter):
+    """Full-run, phase-aggregated metrics over time."""
+
+    plot_name = "phase_aggregate_metrics"
+    plot_title = "Phase Metrics (All Iterations)"
+    metrics: Sequence[Tuple[str, str]] = ()
+    use_time_axis: bool = True
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(len(self.metrics), 1, figsize=(14, 4.0 * len(self.metrics)), sharex=True)
+        if len(self.metrics) == 1:
+            axes = np.asarray([axes])
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray(axes)
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        phases = ["rollout", "rl_policy", "training", "unknown"]
+        phase_styles = {
+            "rollout": {"marker": "o", "linestyle": "-"},
+            "rl_policy": {"marker": "s", "linestyle": "--"},
+            "training": {"marker": "^", "linestyle": "-."},
+            "unknown": {"marker": "x", "linestyle": ":"},
+        }
+
+        for ax, (metric, ylabel) in zip(np.ravel(axes), self.metrics):
+            series, x_col, x_label = build_phase_metric_timeseries(
+                self.annotated_df, metric, use_time_axis=self.use_time_axis
+            )
+            if series.empty or metric not in series.columns:
+                ax.set_title(f"{ylabel} (missing column: {metric})")
+                continue
+
+            for phase in phases:
+                phase_df = series[series["phase_name"] == phase]
+                if phase_df.empty:
+                    continue
+                color = PHASE_COLORS.get(phase, PHASE_COLORS["unknown"])
+                style = phase_styles.get(phase, {"marker": "o", "linestyle": "-"})
+                ax.plot(
+                    phase_df[x_col],
+                    phase_df[metric],
+                    color=color,
+                    alpha=0.8,
+                    linewidth=1.6,
+                    marker=style["marker"],
+                    markersize=4,
+                    linestyle=style["linestyle"],
+                    label=phase,
+                )
+
+            ax.set_ylabel(ylabel)
+            ax.set_title(ylabel)
+            ax.grid(True, alpha=self.theme.grid_alpha)
+            ax.set_xlabel(x_label)
+
+        handles, labels = np.ravel(axes)[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.92, 0.95), frameon=False)
+
+
+class PhaseAggregateSMClockPlotter(PhaseAggregateMetricsPlotter):
+    plot_name = "phase_sm_clock"
+    plot_title = "SM Clock by Phase (All Iterations)"
+    metrics = (("sm_clock_mhz", "SM Clock (MHz)"),)
+
+
+class PhaseAggregateMemoryClockPlotter(PhaseAggregateMetricsPlotter):
+    plot_name = "phase_memory_clock"
+    plot_title = "Memory Clock by Phase (All Iterations)"
+    metrics = (("mem_clock_mhz", "Memory Clock (MHz)"),)
+
+
 class PhaseEnergyTimeStackedPlotter(BasePlotter):
     """Energy and time distribution across phases (100% stacked bars)."""
 
@@ -335,6 +455,83 @@ class PhaseEnergyTimeStackedPlotter(BasePlotter):
         axes[0].set_title("Energy and Time Distribution")
         axes[0].grid(True, axis="y", alpha=self.theme.grid_alpha)
         axes[0].legend(loc="upper right", title="Phase")
+
+
+class PhasePeakPowerPlotter(BasePlotter):
+    """Peak power draw per phase (p95/p99/max)."""
+
+    plot_name = "phase_peak_power"
+    plot_title = "Peak Power Draw by Phase"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(12, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        df = self.annotated_df.copy()
+        if "phase_name" not in df.columns or "power_draw_w" not in df.columns:
+            axes[0].set_title("Missing phase_name or power_draw_w.")
+            return
+
+        df = df[df["phase_name"] != "idle"]
+        if df.empty:
+            axes[0].set_title("No non-idle phase data.")
+            return
+
+        df["power_draw_w"] = pd.to_numeric(df["power_draw_w"], errors="coerce")
+        grouped = df.groupby("phase_name", dropna=False)["power_draw_w"]
+
+        phases = ["rollout", "rl_policy", "training"]
+        phases.extend([p for p in grouped.groups.keys() if p not in phases])
+        phases = [p for p in phases if p in grouped.groups]
+
+        p95_vals = []
+        p99_vals = []
+        max_vals = []
+        for phase in phases:
+            series = grouped.get_group(phase).dropna()
+            if series.empty:
+                p95_vals.append(np.nan)
+                p99_vals.append(np.nan)
+                max_vals.append(np.nan)
+                continue
+            p95_vals.append(float(series.quantile(0.95)))
+            p99_vals.append(float(series.quantile(0.99)))
+            max_vals.append(float(series.max()))
+
+        x = np.arange(len(phases))
+        bar_width = 0.22
+        offsets = [-bar_width, 0.0, bar_width]
+        metric_labels = ["p95", "p99", "max"]
+        hatches = {"p95": "//", "p99": "..", "max": ""}
+
+        for vals, label, offset in zip([p95_vals, p99_vals, max_vals], metric_labels, offsets):
+            for idx, phase in enumerate(phases):
+                color = PHASE_COLORS.get(phase, PHASE_COLORS["unknown"])
+                axes[0].bar(
+                    x[idx] + offset,
+                    vals[idx],
+                    width=bar_width,
+                    color=color,
+                    alpha=0.9,
+                    hatch=hatches[label],
+                    edgecolor="#2c3e50",
+                    linewidth=0.4,
+                )
+
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(phases, rotation=20, ha="right")
+        axes[0].set_ylabel("Power (W)")
+        axes[0].set_title("Peak Power Draw by Phase")
+        axes[0].grid(True, axis="y", alpha=self.theme.grid_alpha)
+
+        legend_handles = [
+            plt.Rectangle((0, 0), 1, 1, color="#95a5a6", hatch=hatches[label], label=label)
+            for label in metric_labels
+        ]
+        axes[0].legend(handles=legend_handles, loc="upper right", title="Metric")
 
 
 class PhaseBoxplotPlotter(BasePlotter):

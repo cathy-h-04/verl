@@ -1,0 +1,135 @@
+{
+  "defaults": {
+    "color": "#7f8c8d",
+    "linestyle": "-",
+    "hatch": ""
+  },
+  "runs": [
+    {
+      "name": "llama_ppo_boxplots",
+      "plot_match": "^phase_boxplots$",
+      "run_match": "ppo.*llama3\\.1",
+      "color": "#1f4e79",
+      "hatch": ""
+    },
+    {
+      "name": "llama_remax_boxplots",
+      "plot_match": "^phase_boxplots$",
+      "run_match": "remax.*llama3\\.1",
+      "color": "#c65f00",
+      "hatch": ""
+    },
+    {
+      "name": "llama_grpo_boxplots",
+      "plot_match": "^phase_boxplots$",
+      "run_match": "grpo.*llama3\\.1",
+      "color": "#4b0082",
+      "hatch": ""
+    },
+    {
+      "name": "qwen_ppo_boxplots",
+      "plot_match": "^phase_boxplots$",
+      "run_match": "ppo.*qwen2\\.5",
+      "color": "#a6cee3",
+      "hatch": "."
+    },
+    {
+      "name": "qwen_remax_boxplots",
+      "plot_match": "^phase_boxplots$",
+      "run_match": "remax.*qwen2\\.5",
+      "color": "#fdbf6f",
+      "hatch": "."
+    },
+    {
+      "name": "qwen_grpo_boxplots",
+      "plot_match": "^phase_boxplots$",
+      "run_match": "grpo.*qwen2\\.5",
+      "color": "#c3a1e8",
+      "hatch": "."
+    },
+    {
+      "name": "llama_ppo_phase_aggregate",
+      "plot_match": "^phase_aggregate$",
+      "run_match": "ppo.*llama3\\.1",
+      "color": "#1f4e79",
+      "hatch": ""
+    },
+    {
+      "name": "llama_remax_phase_aggregate",
+      "plot_match": "^phase_aggregate$",
+      "run_match": "remax.*llama3\\.1",
+      "color": "#c65f00",
+      "hatch": ""
+    },
+    {
+      "name": "llama_grpo_phase_aggregate",
+      "plot_match": "^phase_aggregate$",
+      "run_match": "grpo.*llama3\\.1",
+      "color": "#4b0082",
+      "hatch": ""
+    },
+    {
+      "name": "qwen_ppo_phase_aggregate",
+      "plot_match": "^phase_aggregate$",
+      "run_match": "ppo.*qwen2\\.5",
+      "color": "#a6cee3",
+      "hatch": "\\\\\\\\"
+    },
+    {
+      "name": "qwen_remax_phase_aggregate",
+      "plot_match": "^phase_aggregate$",
+      "run_match": "remax.*qwen2\\.5",
+      "color": "#fdbf6f",
+      "hatch": "\\\\\\\\"
+    },
+    {
+      "name": "qwen_grpo_phase_aggregate",
+      "plot_match": "^phase_aggregate$",
+      "run_match": "grpo.*qwen2\\.5",
+      "color": "#c3a1e8",
+      "hatch": "\\\\\\\\"
+    },
+    {
+      "name": "llama_ppo_lines",
+      "plot_match": "phase_focus|learning_price|thermal_steady_state|throughput_reward_frontier|throughput_vs_length|energy_per_token",
+      "run_match": "ppo.*llama3\\.1",
+      "color": "#1f4e79",
+      "linestyle": "-"
+    },
+    {
+      "name": "llama_remax_lines",
+      "plot_match": "phase_focus|learning_price|thermal_steady_state|throughput_reward_frontier|throughput_vs_length|energy_per_token",
+      "run_match": "remax.*llama3\\.1",
+      "color": "#c65f00",
+      "linestyle": "-"
+    },
+    {
+      "name": "llama_grpo_lines",
+      "plot_match": "phase_focus|learning_price|thermal_steady_state|throughput_reward_frontier|throughput_vs_length|energy_per_token",
+      "run_match": "grpo.*llama3\\.1",
+      "color": "#4b0082",
+      "linestyle": "-"
+    },
+    {
+      "name": "qwen_ppo_lines",
+      "plot_match": "phase_focus|learning_price|thermal_steady_state|throughput_reward_frontier|throughput_vs_length|energy_per_token",
+      "run_match": "ppo.*qwen2\\.5",
+      "color": "#a6cee3",
+      "linestyle": "--"
+    },
+    {
+      "name": "qwen_remax_lines",
+      "plot_match": "phase_focus|learning_price|thermal_steady_state|throughput_reward_frontier|throughput_vs_length|energy_per_token",
+      "run_match": "remax.*qwen2\\.5",
+      "color": "#fdbf6f",
+      "linestyle": "--"
+    },
+    {
+      "name": "qwen_grpo_lines",
+      "plot_match": "phase_focus|learning_price|thermal_steady_state|throughput_reward_frontier|throughput_vs_length|energy_per_token",
+      "run_match": "grpo.*qwen2\\.5",
+      "color": "#c3a1e8",
+      "linestyle": "--"
+    }
+  ]
+}

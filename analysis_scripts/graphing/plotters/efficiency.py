@@ -317,6 +317,101 @@ class LearningPricePlotter(BasePlotter):
                 )
 
 
+class EnergyPerTokenPlotter(BasePlotter):
+    """Energy per token (or useful token) over time."""
+
+    plot_name = "energy_per_token"
+    plot_title = "Energy per Token"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+        df = self.merged_df
+        throughput_col = "data.perf/throughput"
+        tokens_col = "data.perf/total_num_tokens"
+        aborted_col = "data.response/aborted_ratio"
+
+        if throughput_col not in df.columns:
+            ax.set_title("Missing throughput data.")
+            return
+
+        work = df.copy()
+        if "step" in work.columns:
+            work = work.sort_values("step")
+
+        throughput = pd.to_numeric(work[throughput_col], errors="coerce")
+        tokens = pd.to_numeric(work.get(tokens_col), errors="coerce")
+
+        power_mean = None
+        if self.annotated_df is not None and "power_draw_w" in self.annotated_df.columns:
+            power_df = self.annotated_df.copy()
+            if "phase_name" in power_df.columns:
+                power_df = power_df[power_df["phase_name"] != "idle"]
+            power_mean = pd.to_numeric(power_df["power_draw_w"], errors="coerce").mean()
+
+        if power_mean is None or not np.isfinite(power_mean):
+            ax.set_title("Missing power draw data.")
+            return
+
+        use_useful = False
+        if aborted_col in work.columns:
+            aborted = pd.to_numeric(work[aborted_col], errors="coerce")
+            if aborted.notna().any() and float(aborted.mean()) > 0.01:
+                use_useful = True
+                throughput = throughput * (1.0 - aborted)
+
+        energy_per_token = power_mean / throughput.replace(0, np.nan)
+
+        tokens_cum = None
+        if tokens.notna().any():
+            diffs = tokens.diff()
+            non_decreasing_ratio = (diffs.dropna() >= 0).mean() if diffs.notna().any() else 0.0
+            if non_decreasing_ratio >= 0.9:
+                tokens_cum = tokens
+
+        if tokens_cum is None:
+            time_per_step = pd.to_numeric(work.get("data.perf/time_per_step"), errors="coerce")
+            per_step_tokens = throughput * time_per_step
+            if per_step_tokens.notna().any():
+                tokens_cum = per_step_tokens.fillna(0).cumsum()
+
+        if tokens_cum is not None and tokens_cum.notna().any():
+            x = tokens_cum
+            x_label = "Total Tokens"
+        else:
+            x = pd.to_numeric(work.get("step"), errors="coerce")
+            x_label = "Step"
+
+        mask = x.notna() & energy_per_token.notna()
+        if not mask.any():
+            ax.set_title("No valid energy-per-token data.")
+            return
+
+        order = np.argsort(x[mask].to_numpy())
+        x_sorted = x[mask].to_numpy()[order]
+        y_sorted = energy_per_token[mask].to_numpy()[order]
+
+        ax.plot(x_sorted, y_sorted, color="#95a5a6", linewidth=0.8, alpha=0.6)
+        window = max(3, int(len(y_sorted) * 0.1))
+        if len(y_sorted) >= window:
+            y_smooth = pd.Series(y_sorted).rolling(window=window, min_periods=max(2, window // 3)).mean().to_numpy()
+            ax.plot(x_sorted, y_smooth, color="#2ecc71", linewidth=1.6)
+
+        ylabel = "Energy per Useful Token (J)" if use_useful else "Energy per Token (J)"
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(ylabel)
+        ax.set_title("Energy per Token")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+
 class TokenBottlenecksPlotter(BasePlotter):
     """Horizontal bar chart for per-token timing micro-bottlenecks."""
 

@@ -25,13 +25,22 @@ from ..core.style_config import RunStyleConfig
 from ..core.loaders import RunPaths, compute_sample_durations_seconds
 from ..plotters.hardware import (
     GPUOverviewPlotter,
+    EnergyVsSMClockPlotter,
     PhaseComputeDensityPlotter,
     SmoothedTimeSeriesPlotter,
     ThermalSteadyStatePlotter,
+    PstateDistributionPlotter,
+    UtilizationSmClockScatterPlotter,
+    UtilizationMemoryScatterPlotter,
+    PhaseFingerprintPlotter,
+    _phase_fingerprint_summary,
 )
 from ..plotters.timing import (
     HierarchicalWaterfallPlotter,
     PhaseAggregatePlotter,
+    PhaseAggregateMemoryClockPlotter,
+    PhaseAggregateSMClockPlotter,
+    PhasePeakPowerPlotter,
     PhaseBoxplotPlotter,
     PhaseCorrelationPlotter,
     PhaseEnergyTimeStackedPlotter,
@@ -39,9 +48,11 @@ from ..plotters.timing import (
     PhaseFocusRolloutPlotter,
     PhaseFocusTrainingPlotter,
     PhaseTimelinePlotter,
+    build_phase_metric_timeseries,
 )
 from ..plotters.efficiency import (
     BottleneckEvolutionPlotter,
+    EnergyPerTokenPlotter,
     HardwareROIPlotter,
     LearningPricePlotter,
     MFUComparisonPlotter,
@@ -356,13 +367,20 @@ def _pad_bounds(
     return (min_v, max_v)
 
 
+_BOUNDS_REFERENCE_RUNS: Optional[Sequence[RunPaths]] = None
+
+
+def _get_bounds_runs(runs: Sequence[RunPaths]) -> Sequence[RunPaths]:
+    return _BOUNDS_REFERENCE_RUNS if _BOUNDS_REFERENCE_RUNS is not None else runs
+
+
 def _bounds_for_column(
     runs: Sequence[RunPaths],
     df_attr: str,
     col: str,
 ) -> Optional[Tuple[float, float]]:
     bounds: Optional[Tuple[float, float]] = None
-    for run in runs:
+    for run in _get_bounds_runs(runs):
         df = getattr(run, df_attr, None)
         if df is None or col not in df.columns:
             continue
@@ -594,6 +612,68 @@ def _learning_price_series(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
         per_step_tokens = throughput * time_per_step
         tokens_cum = per_step_tokens.fillna(0).cumsum()
     return tokens_cum, reward
+
+
+def _average_power_w(df: Optional[pd.DataFrame]) -> Optional[float]:
+    if df is None or df.empty or "power_draw_w" not in df.columns:
+        return None
+    work = df.copy()
+    if "phase_name" in work.columns:
+        work = work[work["phase_name"] != "idle"]
+    series = pd.to_numeric(work["power_draw_w"], errors="coerce")
+    mean_val = series.mean()
+    return float(mean_val) if np.isfinite(mean_val) else None
+
+
+def _useful_token_preferred(runs: Sequence[RunPaths]) -> bool:
+    for run in runs:
+        df = run.merged_df
+        if df is None:
+            continue
+        aborted = pd.to_numeric(df.get("data.response/aborted_ratio"), errors="coerce")
+        if aborted.notna().any() and float(aborted.mean()) > 0.01:
+            return True
+        non_abort = pd.to_numeric(df.get("data.response_length_non_aborted/mean"), errors="coerce")
+        resp_len = pd.to_numeric(df.get("data.response_length/mean"), errors="coerce")
+        if non_abort.notna().any() and resp_len.notna().any():
+            ratio = (non_abort / resp_len.replace(0, np.nan)).dropna()
+            if not ratio.empty and float(ratio.mean()) < 0.95:
+                return True
+    return False
+
+
+def _energy_per_token_series(
+    run: RunPaths,
+    use_useful: bool,
+) -> Optional[Tuple[pd.Series, pd.Series]]:
+    if run.merged_df is None:
+        return None
+    df = run.merged_df.copy()
+    if "step" in df.columns:
+        df = df.sort_values("step")
+
+    throughput = pd.to_numeric(df.get("data.perf/throughput"), errors="coerce")
+    if throughput is None:
+        return None
+
+    if use_useful:
+        aborted = pd.to_numeric(df.get("data.response/aborted_ratio"), errors="coerce")
+        if aborted.notna().any():
+            throughput = throughput * (1.0 - aborted)
+        else:
+            non_abort = pd.to_numeric(df.get("data.response_length_non_aborted/mean"), errors="coerce")
+            resp_len = pd.to_numeric(df.get("data.response_length/mean"), errors="coerce")
+            ratio = non_abort / resp_len.replace(0, np.nan)
+            if ratio.notna().any():
+                throughput = throughput * ratio
+
+    power_mean = _average_power_w(run.annotated_df)
+    if power_mean is None or not np.isfinite(power_mean):
+        return None
+
+    energy_per_token = power_mean / throughput.replace(0, np.nan)
+    tokens_cum, _ = _learning_price_series(df)
+    return tokens_cum, energy_per_token
 
 
 def _draw_hardware_roi(ax: plt.Axes, df: Optional[pd.DataFrame], reward_col: str) -> Optional[plt.Axes]:
@@ -867,16 +947,229 @@ def _quad_phase_compute_density(
     return out_path
 
 
+def _energy_vs_sm_bounds(df: pd.DataFrame) -> Optional[Tuple[float, float, float, float]]:
+    if df is None or df.empty:
+        return None
+    if "power_draw_w" not in df.columns or "sm_clock_mhz" not in df.columns:
+        return None
+    work = df.copy()
+    if "phase_name" in work.columns:
+        work = work[work["phase_name"] != "idle"]
+    if "iteration" in work.columns:
+        iterations = pd.to_numeric(work["iteration"], errors="coerce")
+        work = work[iterations > 10]
+    if work.empty:
+        return None
+    dt = compute_sample_durations_seconds(work)
+    power = pd.to_numeric(work["power_draw_w"], errors="coerce")
+    sm_clock = pd.to_numeric(work["sm_clock_mhz"], errors="coerce")
+    energy = power * dt
+    energy = pd.to_numeric(energy, errors="coerce")
+    energy_bounds = _finite_min_max(energy)
+    sm_bounds = _finite_min_max(sm_clock)
+    if energy_bounds is None or sm_bounds is None:
+        return None
+    return (energy_bounds[0], energy_bounds[1], sm_bounds[0], sm_bounds[1])
+
+
+def _pstate_distribution_bounds() -> Tuple[float, float]:
+    return (0.0, 1.0)
+
+
+def _util_sm_clock_bounds(runs: Sequence[RunPaths]) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+    return (
+        _bounds_for_column(runs, "annotated_df", "gpu_util_percent"),
+        _bounds_for_column(runs, "annotated_df", "sm_clock_mhz"),
+    )
+
+
+def _util_memory_bounds(runs: Sequence[RunPaths]) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+    return (
+        _bounds_for_column(runs, "annotated_df", "memory_util_percent"),
+        _bounds_for_column(runs, "annotated_df", "memory_used_gb"),
+    )
+
+
+def _phase_fingerprint_maxima(runs: Sequence[RunPaths]) -> Dict[str, float]:
+    maxima: Dict[str, float] = {}
+    for run in runs:
+        summary = _phase_fingerprint_summary(run.annotated_df)
+        if summary is None or summary.empty:
+            continue
+        for metric, _ in PhaseFingerprintPlotter.metrics:
+            series = pd.to_numeric(summary.get(metric), errors="coerce")
+            if series.notna().any():
+                max_val = float(series.max())
+                if metric not in maxima or max_val > maxima[metric]:
+                    maxima[metric] = max_val
+    return maxima
+
+
+def _quad_energy_vs_sm_clock(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+) -> Optional[Path]:
+    bounds_runs = _get_bounds_runs(runs)
+    x_bounds = None
+    y_bounds = None
+    for run in bounds_runs:
+        bounds = _energy_vs_sm_bounds(run.annotated_df)
+        if bounds is None:
+            continue
+        x_bounds = _merge_bounds(x_bounds, (bounds[0], bounds[1]))
+        y_bounds = _merge_bounds(y_bounds, (bounds[2], bounds[3]))
+
+    x_bounds = _pad_bounds(x_bounds, min_floor=0.0)
+    y_bounds = _pad_bounds(y_bounds)
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 6))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = EnergyVsSMClockPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        _apply_limits(ax, x_bounds, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{EnergyVsSMClockPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_pstate_distribution(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+) -> Optional[Path]:
+    y_bounds = _pstate_distribution_bounds()
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 6))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = PstateDistributionPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        _apply_limits(ax, None, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{PstateDistributionPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_util_sm_clock_scatter(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+) -> Optional[Path]:
+    x_bounds, y_bounds = _util_sm_clock_bounds(runs)
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 5))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = UtilizationSmClockScatterPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        _apply_limits(ax, x_bounds, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{UtilizationSmClockScatterPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_util_memory_scatter(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+) -> Optional[Path]:
+    x_bounds, y_bounds = _util_memory_bounds(runs)
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 5))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = UtilizationMemoryScatterPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        _apply_limits(ax, x_bounds, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{UtilizationMemoryScatterPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_phase_fingerprint(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+) -> Optional[Path]:
+    maxima = _phase_fingerprint_maxima(runs)
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 5.5))
+    axes_list = []
+    mappable = None
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = PhaseFingerprintPlotter(run, output_dir, theme)
+        plotter.metric_maxima = maxima
+        plotter.show_colorbar = False
+        plotter.draw(fig, axes)
+        if mappable is None and plotter.last_mappable is not None:
+            mappable = plotter.last_mappable
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    if mappable is not None:
+        fig.subplots_adjust(right=0.93)
+        cax = fig.add_axes([0.94, 0.12, 0.015, 0.72])
+        fig.colorbar(mappable, cax=cax)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{PhaseFingerprintPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
 def _quad_phase_timeline(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
 ) -> Optional[Path]:
     metrics = PhaseTimelinePlotter.metric_columns
+    bounds_runs = _get_bounds_runs(runs)
     x_bounds = None
     y_bounds = {metric: None for metric, _ in metrics}
 
-    for run in runs:
+    for run in bounds_runs:
         x_vals = _phase_timeline_x(run.annotated_df)
         if x_vals is not None:
             x_bounds = _merge_bounds(x_bounds, _finite_min_max(x_vals))
@@ -969,7 +1262,11 @@ def _quad_phase_aggregate(
     phases.extend(sorted(p for p in phases_set if p not in phases))
 
     y_bounds: Dict[str, Optional[Tuple[float, float]]] = {metric: None for metric, _ in metrics}
-    for summary in summaries:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
+        summary = _phase_aggregate_summary(run.annotated_df)
+        if summary is None:
+            continue
         for metric, _ in metrics:
             if metric not in summary.columns:
                 continue
@@ -1111,9 +1408,25 @@ def _quad_phase_focus(
         key=lambda item: _legend_sort_key(item[5], item[2], item[3]),
     )
 
+    bounds_runs = _get_bounds_runs(runs)
+    bounds_inputs: List[Tuple[pd.DataFrame, str]] = []
+    for run in bounds_runs:
+        result = _phase_focus_df(run, focus_window)
+        if result is None:
+            continue
+        df, x_col = result
+        if "phase_name" not in df.columns:
+            continue
+        df = df[df["phase_name"] == focus_phase].copy()
+        if df.empty:
+            continue
+        if "iteration" in df.columns and x_col == "iteration":
+            df["iteration"] = pd.to_numeric(df["iteration"], errors="coerce")
+        bounds_inputs.append((df, x_col))
+
     x_bounds = None
     y_bounds = {metric: None for metric, _ in metrics}
-    for df, x_col, _, _, _, _ in run_data:
+    for df, x_col in bounds_inputs or [(d, x) for d, x, *_ in run_data]:
         if x_col in df.columns:
             x_bounds = _merge_bounds(x_bounds, _finite_min_max(pd.to_numeric(df[x_col], errors="coerce")))
         for metric, _ in metrics:
@@ -1322,11 +1635,22 @@ def _quad_phase_boxplots(
         palette[label] = color
         label_to_hatch[label] = hatch
 
+    bounds_runs = _get_bounds_runs(runs)
+    bounds_frames: List[pd.DataFrame] = []
+    for run in bounds_runs:
+        df = run.annotated_df
+        if df is None or "phase_name" not in df.columns:
+            continue
+        df = df[df["phase_name"] != "idle"].copy()
+        if df.empty:
+            continue
+        bounds_frames.append(df)
+    bounds_combined = pd.concat(bounds_frames, ignore_index=True) if bounds_frames else combined
     y_bounds: Dict[str, Optional[Tuple[float, float]]] = {metric: None for metric, _ in metrics}
     for metric, _ in metrics:
-        if metric not in combined.columns:
+        if metric not in bounds_combined.columns:
             continue
-        series = pd.to_numeric(combined[metric], errors="coerce")
+        series = pd.to_numeric(bounds_combined[metric], errors="coerce")
         y_bounds[metric] = _merge_bounds(y_bounds[metric], _finite_min_max(series))
     y_bounds = {metric: _pad_bounds(bounds) for metric, bounds in y_bounds.items()}
 
@@ -1514,7 +1838,8 @@ def _quad_hierarchical_waterfall(
     theme: ThemeConfig,
 ) -> Optional[Path]:
     max_total = None
-    for run in runs:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
         df = run.timings_df
         if df is None or df.empty:
             continue
@@ -2060,7 +2385,8 @@ def _quad_learning_price(
 ) -> Optional[Path]:
     x_bounds = None
     y_bounds = None
-    for run in runs:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
         df = run.merged_df
         if df is None:
             continue
@@ -2138,13 +2464,161 @@ def _quad_learning_price(
     return out_path
 
 
+def _combined_energy_per_token(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    use_useful = _useful_token_preferred(runs)
+    algo_linestyles = {
+        "PPO": "-",
+        "ReMax": (0, (6, 4)),
+        "GRPO": (0, (6, 4)),
+        "DPO": (0, (5, 2, 1, 2)),
+        "SFT": (0, (1, 6)),
+    }
+    algo_cmaps = _default_algo_cmaps()
+    algo_color_map = _build_algo_color_map(
+        [_extract_algo_and_gpu(run.run_name) for run in runs],
+        algo_cmaps,
+    )
+    unknown_color = "#7f8c8d"
+
+    ordered_runs = sorted(
+        runs,
+        key=lambda run: _legend_sort_key(run.run_name, get_clean_label(run.run_name)),
+    )
+
+    x_bounds = None
+    y_bounds = None
+    for run in ordered_runs:
+        series = _energy_per_token_series(run, use_useful)
+        if series is None:
+            continue
+        tokens_cum, energy_per_token = series
+        x_bounds = _merge_bounds(x_bounds, _finite_min_max(tokens_cum))
+        y_bounds = _merge_bounds(y_bounds, _finite_min_max(energy_per_token))
+
+    x_bounds = _pad_bounds(x_bounds, min_floor=0.0)
+    y_bounds = _pad_bounds(y_bounds)
+
+    apply_theme(theme)
+    fig, ax = plt.subplots(1, 1, figsize=(7.6, 5.1))
+
+    plotted = 0
+    for run in ordered_runs:
+        series = _energy_per_token_series(run, use_useful)
+        if series is None:
+            continue
+        tokens_cum, energy_per_token = series
+        mask = tokens_cum.notna() & energy_per_token.notna()
+        if mask.sum() < 2:
+            continue
+        x = tokens_cum[mask].to_numpy()
+        y = energy_per_token[mask].to_numpy()
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+
+        coeffs = np.polyfit(x, y, deg=1)
+        fit_x = np.linspace(x.min(), x.max(), 100)
+        fit_y = coeffs[0] * fit_x + coeffs[1]
+
+        label = get_clean_label(run.run_name)
+        algo_label, gpu_count = _extract_algo_and_gpu(run.run_name)
+        color, _, linestyle = _resolve_run_style(
+            run_name=run.run_name,
+            label=label,
+            algo_label=algo_label,
+            gpu_count=gpu_count,
+            style_config=style_config,
+            algo_color_map=algo_color_map,
+            unknown_color=unknown_color,
+            algo_linestyles=algo_linestyles,
+            plot_name=EnergyPerTokenPlotter.plot_name,
+        )
+        ax.plot(
+            fit_x,
+            fit_y,
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.8,
+            alpha=0.9,
+            label=label,
+        )
+        plotted += 1
+
+    if plotted == 0:
+        ax.set_title("Energy per token (missing data)")
+    else:
+        ax.set_title("Energy per Useful Token (All Runs)" if use_useful else "Energy per Token (All Runs)")
+        ax.legend(loc="best", fontsize=QUAD_TICK_SIZE)
+
+    ax.set_xlabel("Total Tokens")
+    ax.set_ylabel("Energy per Useful Token (J)" if use_useful else "Energy per Token (J)")
+    ax.grid(True, alpha=theme.grid_alpha)
+    _apply_limits(ax, x_bounds, y_bounds)
+    fig.tight_layout()
+
+    out_path = output_dir / f"{EnergyPerTokenPlotter.plot_name}_all_runs.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_energy_per_token(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    use_useful = _useful_token_preferred(runs)
+    x_bounds = None
+    y_bounds = None
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
+        series = _energy_per_token_series(run, use_useful)
+        if series is None:
+            continue
+        tokens_cum, energy_per_token = series
+        x_bounds = _merge_bounds(x_bounds, _finite_min_max(tokens_cum))
+        y_bounds = _merge_bounds(y_bounds, _finite_min_max(energy_per_token))
+
+    x_bounds = _pad_bounds(x_bounds, min_floor=0.0)
+    y_bounds = _pad_bounds(y_bounds)
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 6))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = EnergyPerTokenPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        _apply_limits(ax, x_bounds, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{EnergyPerTokenPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+
+    _combined_energy_per_token(runs, output_dir, theme, style_config=style_config)
+    return out_path
+
+
 def _quad_token_bottlenecks(
     runs: Sequence[RunPaths],
     output_dir: Path,
     theme: ThemeConfig,
 ) -> Optional[Path]:
     max_mean = None
-    for run in runs:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
         df = run.merged_df
         if df is None:
             continue
@@ -2225,7 +2699,8 @@ def _quad_bottleneck_evolution(
         return _finite_min_max(values)
 
     max_val = None
-    for run in runs:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
         df = run.merged_df
         if df is None:
             continue
@@ -2269,7 +2744,8 @@ def _quad_operation_aggregate(
     }
     x_bounds = {metric: None for metric in metrics}
 
-    for run in runs:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
         summary = _operation_summary(run.annotated_df)
         if summary is None:
             continue
@@ -2311,7 +2787,8 @@ def _quad_operation_comparison(
     metrics = OperationComparisonPlotter.metrics
     y_bounds = {metric: None for metric, _ in metrics}
 
-    for run in runs:
+    bounds_runs = _get_bounds_runs(runs)
+    for run in bounds_runs:
         df = run.annotated_df
         if "operation" not in df.columns:
             continue
@@ -2424,6 +2901,100 @@ def _quad_operation_comparison_metric(
     return out_path
 
 
+def _quad_phase_aggregate_metrics(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    plotter_cls,
+) -> Optional[Path]:
+    metrics = plotter_cls.metrics
+    bounds_runs = _get_bounds_runs(runs)
+    x_bounds = None
+    y_bounds = {metric: None for metric, _ in metrics}
+
+    for run in bounds_runs:
+        for metric, _ in metrics:
+            series, x_col, _ = build_phase_metric_timeseries(run.annotated_df, metric, use_time_axis=True)
+            if series.empty or metric not in series.columns:
+                continue
+            x_bounds = _merge_bounds(x_bounds, _finite_min_max(series[x_col]))
+            y_bounds[metric] = _merge_bounds(y_bounds[metric], _finite_min_max(series[metric]))
+
+    x_bounds = _pad_bounds(x_bounds, min_floor=0.0)
+    y_bounds = {metric: _pad_bounds(bounds) for metric, bounds in y_bounds.items()}
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((14, 10))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, len(metrics), 1, sharex=True)
+        plotter = plotter_cls(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        for ax, (metric, _) in zip(np.ravel(axes), metrics):
+            _apply_limits(ax, x_bounds, y_bounds.get(metric))
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{plotter_cls.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _phase_peak_power_values(df: pd.DataFrame) -> Optional[Tuple[float, float, float]]:
+    if df is None or df.empty:
+        return None
+    if "phase_name" not in df.columns or "power_draw_w" not in df.columns:
+        return None
+    work = df.copy()
+    work = work[work["phase_name"] != "idle"]
+    if work.empty:
+        return None
+    series = pd.to_numeric(work["power_draw_w"], errors="coerce").dropna()
+    if series.empty:
+        return None
+    return float(series.quantile(0.95)), float(series.quantile(0.99)), float(series.max())
+
+
+def _quad_phase_peak_power(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+) -> Optional[Path]:
+    bounds_runs = _get_bounds_runs(runs)
+    max_val = None
+    for run in bounds_runs:
+        vals = _phase_peak_power_values(run.annotated_df)
+        if vals is None:
+            continue
+        max_val = max(max_val or 0.0, max(vals))
+
+    y_bounds = _pad_bounds((0.0, max_val)) if max_val is not None else None
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((12, 6))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = PhasePeakPowerPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        _apply_limits(ax, None, y_bounds)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{PhasePeakPowerPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
 def _quad_plotters() -> Mapping[str, callable]:
     return {
         GPUOverviewPlotter.plot_name: _quad_gpu_overview,
@@ -2444,12 +3015,25 @@ def _quad_plotters() -> Mapping[str, callable]:
         SmoothedTimeSeriesPlotter.plot_name: _quad_smoothed_timeseries,
         ThermalSteadyStatePlotter.plot_name: _quad_thermal_steady_state,
         PhaseComputeDensityPlotter.plot_name: _quad_phase_compute_density,
+        EnergyVsSMClockPlotter.plot_name: _quad_energy_vs_sm_clock,
+        PstateDistributionPlotter.plot_name: _quad_pstate_distribution,
+        UtilizationSmClockScatterPlotter.plot_name: _quad_util_sm_clock_scatter,
+        UtilizationMemoryScatterPlotter.plot_name: _quad_util_memory_scatter,
+        PhaseFingerprintPlotter.plot_name: _quad_phase_fingerprint,
+        PhaseAggregateSMClockPlotter.plot_name: lambda runs, out, theme, style_config=None: _quad_phase_aggregate_metrics(
+            runs, out, theme, PhaseAggregateSMClockPlotter
+        ),
+        PhaseAggregateMemoryClockPlotter.plot_name: lambda runs, out, theme, style_config=None: _quad_phase_aggregate_metrics(
+            runs, out, theme, PhaseAggregateMemoryClockPlotter
+        ),
+        PhasePeakPowerPlotter.plot_name: _quad_phase_peak_power,
         HierarchicalWaterfallPlotter.plot_name: _quad_hierarchical_waterfall,
         MFUComparisonPlotter.plot_name: _quad_mfu_comparison,
         ThroughputVsLengthPlotter.plot_name: _quad_throughput_vs_length,
         ThroughputRewardFrontierPlotter.plot_name: _quad_throughput_reward_frontier,
         HardwareROIPlotter.plot_name: _quad_hardware_roi,
         LearningPricePlotter.plot_name: _quad_learning_price,
+        EnergyPerTokenPlotter.plot_name: _quad_energy_per_token,
         TokenBottlenecksPlotter.plot_name: _quad_token_bottlenecks,
         BottleneckEvolutionPlotter.plot_name: _quad_bottleneck_evolution,
         SweepMetricsPlotter.plot_name: _quad_sweep_metrics,

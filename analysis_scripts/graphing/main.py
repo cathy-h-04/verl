@@ -12,15 +12,28 @@ if __package__ is None or __package__ == "":  # pragma: no cover
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
     __package__ = "analysis_scripts.graphing"
-from typing import Iterable, List, Mapping
+from typing import Iterable, List, Mapping, Union
 
 from .core.base import ThemeConfig
 from .core.style_config import load_style_config
 from .core.loaders import discover_runs
-from .plotters.hardware import GPUOverviewPlotter, PhaseComputeDensityPlotter, SmoothedTimeSeriesPlotter, ThermalSteadyStatePlotter
+from .plotters.hardware import (
+    GPUOverviewPlotter,
+    PhaseComputeDensityPlotter,
+    SmoothedTimeSeriesPlotter,
+    ThermalSteadyStatePlotter,
+    EnergyVsSMClockPlotter,
+    PstateDistributionPlotter,
+    UtilizationSmClockScatterPlotter,
+    UtilizationMemoryScatterPlotter,
+    PhaseFingerprintPlotter,
+)
 from .plotters.timing import (
     HierarchicalWaterfallPlotter,
     PhaseAggregatePlotter,
+    PhaseAggregateMemoryClockPlotter,
+    PhaseAggregateSMClockPlotter,
+    PhasePeakPowerPlotter,
     PhaseBoxplotPlotter,
     PhaseCorrelationPlotter,
     PhaseEnergyTimeStackedPlotter,
@@ -31,6 +44,7 @@ from .plotters.timing import (
 )
 from .plotters.efficiency import (
     BottleneckEvolutionPlotter,
+    EnergyPerTokenPlotter,
     HardwareROIPlotter,
     LearningPricePlotter,
     MFUComparisonPlotter,
@@ -54,10 +68,13 @@ DEFAULTS_NOTICE = (
     "--output-dir plots_monitoring_small_cleaned"
 )
 
-PLOTTERS: Mapping[str, type] = {
+PLOTTERS = {
     "overview": GPUOverviewPlotter,
     "phase_timeline": PhaseTimelinePlotter,
     "phase_aggregate": PhaseAggregatePlotter,
+    "phase_sm_clock": PhaseAggregateSMClockPlotter,
+    "phase_memory_clock": PhaseAggregateMemoryClockPlotter,
+    "phase_peak_power": PhasePeakPowerPlotter,
     "phase_focus_rollout": PhaseFocusRolloutPlotter,
     "phase_focus_rl_policy": PhaseFocusRLPolicyPlotter,
     "phase_focus_training": PhaseFocusTrainingPlotter,
@@ -67,12 +84,18 @@ PLOTTERS: Mapping[str, type] = {
     "smoothed_timeseries": SmoothedTimeSeriesPlotter,
     "thermal_steady_state": ThermalSteadyStatePlotter,
     "phase_compute_density": PhaseComputeDensityPlotter,
+    "energy_vs_sm_clock": EnergyVsSMClockPlotter,
+    "pstate_distribution": PstateDistributionPlotter,
+    "util_sm_clock_scatter": UtilizationSmClockScatterPlotter,
+    "util_memory_scatter": UtilizationMemoryScatterPlotter,
+    "phase_fingerprint": PhaseFingerprintPlotter,
     "hierarchical_waterfall": HierarchicalWaterfallPlotter,
     "mfu_comparison": MFUComparisonPlotter,
     "throughput_vs_length": ThroughputVsLengthPlotter,
     "throughput_reward_frontier": ThroughputRewardFrontierPlotter,
     "hardware_roi": HardwareROIPlotter,
     "learning_price": LearningPricePlotter,
+    "energy_per_token": EnergyPerTokenPlotter,
     "token_micro_bottlenecks": TokenBottlenecksPlotter,
     "bottleneck_evolution": BottleneckEvolutionPlotter,
     "sweep_metrics": SweepMetricsPlotter,
@@ -83,9 +106,11 @@ PLOTTERS: Mapping[str, type] = {
 DEFAULT_PLOTS = (
     "phase_focus_rollout,phase_focus_rl_policy,phase_focus_training,"
     "phase_energy_time_stacked,smoothed_timeseries,phase_boxplots,phase_correlations,"
-    "phase_aggregate,thermal_steady_state,phase_compute_density,hierarchical_waterfall,"
+    "phase_aggregate,thermal_steady_state,phase_compute_density,energy_vs_sm_clock,hierarchical_waterfall,"
+    "pstate_distribution,util_sm_clock_scatter,util_memory_scatter,phase_fingerprint,"
     "mfu_comparison,throughput_vs_length,throughput_reward_frontier,hardware_roi,"
-    "learning_price,token_micro_bottlenecks,bottleneck_evolution"
+    "learning_price,energy_per_token,token_micro_bottlenecks,bottleneck_evolution,"
+    "phase_sm_clock,phase_memory_clock,phase_peak_power"
 )
 
 
@@ -103,7 +128,7 @@ def default_output_dir(root_output: Path, run_paths) -> Path:
     return root_output / run_paths.run_name
 
 
-def _normalize_dir(root: Path, raw: str | Path) -> Path:
+def _normalize_dir(root: Path, raw: Union[str, Path]) -> Path:
     path = Path(raw).expanduser()
     return path if path.is_absolute() else root / path
 

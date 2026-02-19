@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Dict, Mapping, Sequence, Tuple, Optional
 
 import matplotlib.pyplot as plt
 
@@ -130,7 +130,7 @@ class BasePlotter:
         self,
         run_paths,
         output_dir: Path,
-        theme: ThemeConfig | None = None,
+        theme: Optional[ThemeConfig] = None,
     ) -> None:
         self.run_paths = run_paths
         self.output_dir = output_dir
