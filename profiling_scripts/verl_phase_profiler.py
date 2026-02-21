@@ -33,10 +33,11 @@ class PhaseProfiler:
             return
         
         # Use file-based IPC in monitoring directory
+        scratch_dir = os.environ.get("SCRATCH_DIR", "/n/netscratch/yu_lab/Lab/chou")
         monitoring_dir = (
             os.environ.get("MONITORING_DIR")
             or os.environ.get("VERL_FILE_LOGGER_ROOT")
-            or "/home/cathxhou/projects/verl_research/monitoring"
+            or f"{scratch_dir}/logs"
         )
         self.state_file = Path(monitoring_dir) / f"phase_state_{experiment_name}.json"
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -99,10 +100,11 @@ class PhaseReader:
     """Reader class - used by monitoring script to query current phase."""
     
     def __init__(self, experiment_name: str):
+        scratch_dir = os.environ.get("SCRATCH_DIR", "/n/netscratch/yu_lab/Lab/chou")
         monitoring_dir = (
             os.environ.get("MONITORING_DIR")
             or os.environ.get("VERL_FILE_LOGGER_ROOT")
-            or "/home/cathxhou/projects/verl_research/monitoring"
+            or f"{scratch_dir}/logs"
         )
         self.state_file = Path(monitoring_dir) / f"phase_state_{experiment_name}.json"
     

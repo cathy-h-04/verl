@@ -6,29 +6,59 @@
 
 set -euo pipefail
 
+# Ensure SCRATCH_DIR is set for the cluster
+export SCRATCH_DIR="${SCRATCH_DIR:-/n/netscratch/yu_lab/Lab/chou}"
+mkdir -p "$SCRATCH_DIR/logs" "$SCRATCH_DIR/checkpoints" "$SCRATCH_DIR/data"
+if [ -n "${RAY_ADDRESS:-}" ]; then
+    export RAY_ADDRESS
+    echo "Using existing Ray cluster at $RAY_ADDRESS"
+fi
+
 # -------------------- Configuration --------------------
-PROJECT_DIR=/home/cathxhou/projects/verl_research
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 EXPERIMENT_NAME="${1:-gsm8k_profile}"
-MODEL_NAME="${5:-Qwen/Qwen2.5-0.5B-Instruct}"
+MODEL_NAME="${5:-Qwen/Qwen2.5-7B-Instruct}"
 TOTAL_EPOCHS="${2:-1}"
 GPU_ID="${3:-1}"
 GRANULARITY="${4:-phase}"  # 'phase' or 'operation'
 POLICY="${6:-ppo}"  # ppo | remax
 NNODES="${7:-1}"
-N_GPUS_PER_NODE="${8:-2}"
+N_GPUS_PER_NODE="${8:-4}"
 DATASET_NAME="${9:-gsm8k}"
 export EXPERIMENT_NAME
+
+# -------------------- CLI Overrides --------------------
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --resume_path)
+            RESUME_FROM_CHECKPOINT="$2"
+            shift 2
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    export RESUME_FROM_CHECKPOINT
+    echo "Resume from checkpoint: $RESUME_FROM_CHECKPOINT"
+fi
 
 # Rollout tensor parallel size
 TENSOR_PARALLEL_SIZE=1
 # Batch size configuration - SMALL for fast profiling
-TRAIN_BATCH_SIZE=16
+TRAIN_BATCH_SIZE=128
 PPO_MINI_BATCH_SIZE=4
-MICRO_BATCH_SIZE_PER_GPU=1
+MICRO_BATCH_SIZE_PER_GPU=4
 LOG_PROB_MICRO_BATCH_SIZE=4
-GPU_MEMORY_UTIL=0.30
-ROLLOUT_MAX_BATCHED_TOKENS=1536
-ROLLOUT_MAX_MODEL_LEN=1024
+GPU_MEMORY_UTIL=0.50
+ROLLOUT_MAX_BATCHED_TOKENS=8192
+ROLLOUT_MAX_MODEL_LEN=2048
 ROLLOUT_MAX_NUM_SEQS=64
 ROLLOUT_N=4
 ENABLE_GRAD_CHECKPOINTING=true
@@ -43,12 +73,9 @@ fi
 source verl-env/bin/activate
 
 export PYTHONPATH="${PYTHONPATH:-}:${PROJECT_DIR}/verl"
-if [ "$N_GPUS_PER_NODE" -le 1 ]; then
-    export CUDA_VISIBLE_DEVICES="$GPU_ID"
-fi
 export PYTHONUNBUFFERED=1
 # Structured file logging (JSONL) goes to monitoring/<project>/<experiment>.jsonl
-MONITORING_DIR="${MONITORING_DIR:-${PROJECT_DIR}/monitoring}"
+MONITORING_DIR="${MONITORING_DIR:-${SCRATCH_DIR}/logs}"
 export VERL_FILE_LOGGER_ROOT="$MONITORING_DIR"
 
 # Flash attention enabled (requires compatible flash-attn install)
@@ -57,7 +84,7 @@ export VERL_FILE_LOGGER_ROOT="$MONITORING_DIR"
 # -------------------- Dataset Setup --------------------
 case "$DATASET_NAME" in
     gsm8k)
-        DATA_DIR="${PROJECT_DIR}/data/gsm8k"
+        DATA_DIR="${SCRATCH_DIR}/data/gsm8k"
         TRAIN_FILE="${DATA_DIR}/train.parquet"
         VAL_FILE="${DATA_DIR}/test.parquet"
         PREPROCESS_CMD="python3 examples/data_preprocess/gsm8k.py --local_save_dir \"$DATA_DIR\""
@@ -69,8 +96,8 @@ case "$DATASET_NAME" in
 esac
 
 # -------------------- Directory Setup --------------------
-OUTPUT_DIR="${PROJECT_DIR}/outputs/${EXPERIMENT_NAME}"
-LOG_DIR="${PROJECT_DIR}/logs"
+OUTPUT_DIR="${SCRATCH_DIR}/checkpoints/${EXPERIMENT_NAME}"
+LOG_DIR="${SCRATCH_DIR}/logs"
 
 mkdir -p "$DATA_DIR" "$OUTPUT_DIR" "$LOG_DIR"
 
@@ -106,7 +133,7 @@ echo ""
 
 # -------------------- Training --------------------
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${LOG_DIR}/${EXPERIMENT_NAME}_${TIMESTAMP}.log"
+LOG_FILE="${TRAIN_LOG_FILE:-${LOG_DIR}/${EXPERIMENT_NAME}.log}"
 
 echo "========================================"
 echo "Starting PPO Training"
@@ -132,12 +159,17 @@ case "$POLICY" in
         ;;
 esac
 
+RESUME_ARGS=()
+if [ -n "${RESUME_FROM_CHECKPOINT:-}" ]; then
+    RESUME_ARGS+=("trainer.resume_from_checkpoint=$RESUME_FROM_CHECKPOINT")
+fi
+
 python3 -m verl.trainer.main_ppo \
   data.train_files="$TRAIN_FILE" \
   data.val_files="$VAL_FILE" \
   data.train_batch_size=$TRAIN_BATCH_SIZE \
   data.max_prompt_length=512 \
-  data.max_response_length=256 \
+  data.max_response_length=1024 \
   actor_rollout_ref.model.path="$MODEL_NAME" \
   actor_rollout_ref.actor.optim.lr=1e-6 \
   actor_rollout_ref.model.enable_gradient_checkpointing=$ENABLE_GRAD_CHECKPOINTING \
@@ -177,6 +209,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.default_local_dir="$OUTPUT_DIR" \
   +critic.model.override_config.attn_implementation=flash_attention_2 \
   +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
+  "${RESUME_ARGS[@]}" \
   "${POLICY_ARGS[@]}" \
   2>&1 | tee "$LOG_FILE"
 

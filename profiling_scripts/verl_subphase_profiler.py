@@ -15,7 +15,11 @@ from typing import Dict
 
 # Import the original profiler
 import sys
-sys.path.insert(0, '/home/cathxhou/projects/verl_research')
+project_dir = os.environ.get("PROJECT_DIR")
+if not project_dir:
+    project_dir = str(Path(__file__).resolve().parent.parent)
+if project_dir not in sys.path:
+    sys.path.insert(0, project_dir)
 from verl_phase_profiler import PhaseProfiler, PhaseReader, PHASE_IDS, PhaseType
 
 
@@ -49,10 +53,11 @@ class SubPhaseProfiler(PhaseProfiler):
         # Only create timing log if we're doing operation-level profiling
         if self.granularity == 'operation':
             # Create timing log file (JSONL format - one JSON object per line)
+            scratch_dir = os.environ.get("SCRATCH_DIR", "/n/netscratch/yu_lab/Lab/chou")
             monitoring_root = (
                 os.environ.get("MONITORING_DIR")
                 or os.environ.get("VERL_FILE_LOGGER_ROOT")
-                or "/home/cathxhou/projects/verl_research/monitoring"
+                or f"{scratch_dir}/logs"
             )
             monitoring_dir = Path(monitoring_root) / experiment_name
             monitoring_dir.mkdir(parents=True, exist_ok=True)
