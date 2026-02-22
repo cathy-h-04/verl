@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 from typing import Dict, Optional, Sequence, Tuple
 
 import re

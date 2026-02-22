@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Mapping, Sequence, Tuple, Optional
-
 import matplotlib.pyplot as plt
 
 try:

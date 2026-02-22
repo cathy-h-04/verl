@@ -3,7 +3,14 @@
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import argparse
+import os
+import getpass
+import shutil
 import sys
 from pathlib import Path
 
@@ -44,13 +51,19 @@ from .plotters.timing import (
 )
 from .plotters.efficiency import (
     BottleneckEvolutionPlotter,
+    ClockImbalanceMapPlotter,
+    BoostHeadroomHistogramPlotter,
+    PhaseToPhaseStabilityBoxplot,
+    CriticIntensityMapPlotter,
     EnergyPerTokenPlotter,
+    EntropyMfuCollapsePlotter,
     HardwareROIPlotter,
     LearningPricePlotter,
     MFUComparisonPlotter,
     OperationAggregatePlotter,
     OperationComparisonPlotter,
     SweepMetricsPlotter,
+    TailLatencyTaxMapPlotter,
     ThroughputRewardFrontierPlotter,
     ThroughputVsLengthPlotter,
     TokenBottlenecksPlotter,
@@ -58,14 +71,18 @@ from .plotters.efficiency import (
 from .analytics.comparisons import generate_quad_views
 
 
-DEFAULT_REPO_ROOT = Path("/home/cathxhou/projects/verl_research")
-DEFAULT_CLEANED_DIR = "monitoring_small_cleaned"
+DEFAULT_REPO_ROOT = Path("/n/netscratch/yu_lab/Lab/chou")
+DEFAULT_CLEANED_DIR = "monitoring_llama_qwen_cleaned"
 DEFAULT_OUTPUT_DIR = "plots"
+DEFAULT_ARCHIVE_ROOT = Path("/n/home08/chou/verl_research")
+ALLOWED_SCRATCH_ROOT = Path("/n/netscratch/yu_lab/Lab/chou").resolve()
+STAGING_DIRNAME = "temp_plots"
+STAGE_OWNER_FILE = ".stage_owner"
 DEFAULTS_NOTICE = (
     "No arguments provided; using defaults: "
-    "--root /home/cathxhou/projects/verl_research "
-    "--cleaned-dir monitoring_small_cleaned "
-    "--output-dir plots_monitoring_small_cleaned"
+    "--root /n/netscratch/yu_lab/Lab/chou "
+    "--cleaned-dir monitoring_llama_qwen_cleaned "
+    "--output-dir /n/home08/chou/verl_research"
 )
 
 PLOTTERS = {
@@ -96,9 +113,15 @@ PLOTTERS = {
     "hardware_roi": HardwareROIPlotter,
     "learning_price": LearningPricePlotter,
     "energy_per_token": EnergyPerTokenPlotter,
+    "entropy_mfu_collapse": EntropyMfuCollapsePlotter,
     "token_micro_bottlenecks": TokenBottlenecksPlotter,
     "bottleneck_evolution": BottleneckEvolutionPlotter,
     "sweep_metrics": SweepMetricsPlotter,
+    "tail_latency_tax_map": TailLatencyTaxMapPlotter,
+    "clock_imbalance_map": ClockImbalanceMapPlotter,
+    "boost_headroom_histogram": BoostHeadroomHistogramPlotter,
+    "phase_to_phase_stability": PhaseToPhaseStabilityBoxplot,
+    "critic_intensity_map": CriticIntensityMapPlotter,
     "operation_aggregate": OperationAggregatePlotter,
     "operation_comparison": OperationComparisonPlotter,
 }
@@ -109,7 +132,7 @@ DEFAULT_PLOTS = (
     "phase_aggregate,thermal_steady_state,phase_compute_density,energy_vs_sm_clock,hierarchical_waterfall,"
     "pstate_distribution,util_sm_clock_scatter,util_memory_scatter,phase_fingerprint,"
     "mfu_comparison,throughput_vs_length,throughput_reward_frontier,hardware_roi,"
-    "learning_price,energy_per_token,token_micro_bottlenecks,bottleneck_evolution,"
+    "learning_price,energy_per_token,entropy_mfu_collapse,token_micro_bottlenecks,bottleneck_evolution,tail_latency_tax_map,clock_imbalance_map,boost_headroom_histogram,critic_intensity_map,phase_to_phase_stability,"
     "phase_sm_clock,phase_memory_clock,phase_peak_power"
 )
 
@@ -173,11 +196,68 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
             repo_root = root
 
     if args.output_dir != Path(DEFAULT_OUTPUT_DIR):
-        output_dir = _normalize_dir(repo_root, args.output_dir)
+        raw_output = Path(args.output_dir).expanduser()
+        output_dir = raw_output if raw_output.is_absolute() else DEFAULT_ARCHIVE_ROOT / raw_output
     else:
-        label = _plots_label(cleaned_root)
-        output_dir = repo_root / f"plots_{label}"
+        output_dir = DEFAULT_ARCHIVE_ROOT
     return cleaned_root, output_dir
+
+
+def _stage_dir(cleaned_root: Path) -> Path:
+    cleaned_root = cleaned_root.resolve()
+    if ALLOWED_SCRATCH_ROOT not in cleaned_root.parents and cleaned_root != ALLOWED_SCRATCH_ROOT:
+        raise SystemExit(f"Refusing to stage outside {ALLOWED_SCRATCH_ROOT}: {cleaned_root}")
+    return cleaned_root / STAGING_DIRNAME
+
+
+def _ensure_stage_dir(cleaned_root: Path) -> Path:
+    stage_dir = _ensure_stage_dir(cleaned_root)
+
+    owner_path = stage_dir / STAGE_OWNER_FILE
+    user = getpass.getuser()
+    if owner_path.exists():
+        existing_owner = owner_path.read_text().strip()
+        if existing_owner != user:
+            raise SystemExit(
+                f"Refusing to use stage dir owned by '{existing_owner}': {stage_dir}"
+            )
+        # Clean only if owned by current user.
+        for entry in stage_dir.iterdir():
+            if entry.name == STAGE_OWNER_FILE:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+    else:
+        owner_path.write_text(user)
+
+    return stage_dir
+
+
+def _same_filesystem(path_a: Path, path_b: Path) -> bool:
+    try:
+        return path_a.stat().st_dev == path_b.stat().st_dev
+    except FileNotFoundError:
+        return False
+
+
+def _atomic_archive_move(src_dir: Path, dest_dir: Path) -> Path:
+    dest_parent = dest_dir.parent
+    dest_parent.mkdir(parents=True, exist_ok=True)
+
+    if _same_filesystem(src_dir, dest_parent):
+        os.replace(src_dir, dest_dir)
+        return dest_dir
+
+    tmp_name = f".{dest_dir.name}.tmp_{os.getpid()}"
+    tmp_dir = dest_parent / tmp_name
+    if tmp_dir.exists():
+        raise SystemExit(f"Refusing to remove existing temp dir: {tmp_dir}")
+    shutil.copytree(src_dir, tmp_dir)
+    os.replace(tmp_dir, dest_dir)
+    shutil.rmtree(src_dir)
+    return dest_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -188,7 +268,7 @@ def parse_args() -> argparse.Namespace:
         "--root",
         type=Path,
         default=DEFAULT_REPO_ROOT,
-        help="Repo root (default: /home/cathxhou/projects/verl_research).",
+        help="Scratch root (default: /n/netscratch/yu_lab/Lab/chou).",
     )
     parser.add_argument(
         "--name",
@@ -202,7 +282,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path(DEFAULT_OUTPUT_DIR),
-        help="Root output directory for generated graphs (default: plots_<cleaned_dir_name>).",
+        help="Archive root for generated graphs (default: /n/home08/chou/verl_research).",
     )
     parser.add_argument(
         "--style-config",
@@ -239,7 +319,7 @@ def main() -> None:
 
     plot_names = [p.strip() for p in str(args.plots).split(",") if p.strip()]
 
-    cleaned_root, output_dir = resolve_paths(args)
+    cleaned_root, archive_root = resolve_paths(args)
     style_config = None
     style_config_path = args.style_config
     if style_config_path is None:
@@ -259,33 +339,31 @@ def main() -> None:
 
     theme = ThemeConfig()
 
-    print(f"Discovered {len(runs)} run(s) under {cleaned_root}")
-    for run_paths in runs:
-        run_output_dir = default_output_dir(output_dir, run_paths)
-        plotters = build_plotters(run_paths, run_output_dir, plot_names, theme)
-        print(f"\nRun: {run_paths.run_name}")
-        print(f"  Annotated CSV: {run_paths.annotated_csv}")
-        if run_paths.merged_sweep_csv:
-            print(f"  Merged sweep CSV: {run_paths.merged_sweep_csv}")
-        else:
-            print("  Merged sweep CSV: (missing)")
+    stage_dir = _stage_dir(cleaned_root)
+    stage_dir.mkdir(parents=True, exist_ok=True)
 
-        for plotter in plotters:
-            try:
-                out_path = plotter.render()
-                print(f"  ✓ {plotter.plot_name}: {out_path}")
-            except Exception as exc:  # pragma: no cover
-                print(f"  ✗ {plotter.plot_name}: {exc}")
+    print(f"Discovered {len(runs)} run(s) under {cleaned_root}")
 
     quad_outputs = generate_quad_views(
         runs,
-        output_dir,
+        stage_dir,
         plotter_classes=PLOTTERS,
         theme=theme,
         style_config=style_config,
     )
     if quad_outputs:
-        print(f"\nQuad-view plots saved to: {output_dir / 'quad_plots'}")
+        print(f"\nQuad-view plots saved to: {stage_dir / 'quad_plots'}")
+
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+
+    label = _plots_label(cleaned_root)
+    archive_dir = archive_root / f"plots_{label}"
+    if archive_dir.exists():
+        shutil.rmtree(archive_dir)
+    archived = _atomic_archive_move(stage_dir, archive_dir)
+    print(f"\nArchived plots to: {archived}")
 
 
 if __name__ == "__main__":

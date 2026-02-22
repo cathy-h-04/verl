@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import inspect
 import math
 from pathlib import Path
@@ -52,13 +56,19 @@ from ..plotters.timing import (
 )
 from ..plotters.efficiency import (
     BottleneckEvolutionPlotter,
+    ClockImbalanceMapPlotter,
+    BoostHeadroomHistogramPlotter,
+    PhaseToPhaseStabilityBoxplot,
+    CriticIntensityMapPlotter,
     EnergyPerTokenPlotter,
+    EntropyMfuCollapsePlotter,
     HardwareROIPlotter,
     LearningPricePlotter,
     MFUComparisonPlotter,
     OperationAggregatePlotter,
     OperationComparisonPlotter,
     SweepMetricsPlotter,
+    TailLatencyTaxMapPlotter,
     ThroughputRewardFrontierPlotter,
     ThroughputVsLengthPlotter,
     TokenBottlenecksPlotter,
@@ -131,6 +141,54 @@ def get_clean_label(run_name: str) -> str:
     gpu_label = f"{gpu_count} GPUs" if gpu_count is not None else "Unknown GPUs"
 
     return f"{model_label} | {algo_label} | {gpu_label}"
+
+
+def _algo_label_from_run_name(run_name: str) -> str:
+    parts = [p for p in run_name.lower().split("_") if p]
+    for token in parts:
+        if token == "ppo":
+            return "PPO"
+        if token == "grpo":
+            return "GRPO"
+        if token == "remax":
+            return "ReMax"
+    return "Unknown"
+
+
+def _response_length_cv(df: pd.DataFrame) -> Tuple[Optional[pd.Series], Optional[str]]:
+    mean_col = next((c for c in df.columns if "response_length" in c and c.endswith("/mean")), None)
+    std_col = next((c for c in df.columns if "response_length" in c and c.endswith("/std")), None)
+    if std_col and mean_col:
+        mean = pd.to_numeric(df[mean_col], errors="coerce")
+        std = pd.to_numeric(df[std_col], errors="coerce")
+        return std / mean.replace(0, np.nan), "std"
+
+    max_col = next((c for c in df.columns if "response_length" in c and c.endswith("/max")), None)
+    min_col = next((c for c in df.columns if "response_length" in c and c.endswith("/min")), None)
+    if mean_col and max_col and min_col:
+        mean = pd.to_numeric(df[mean_col], errors="coerce")
+        max_val = pd.to_numeric(df[max_col], errors="coerce")
+        min_val = pd.to_numeric(df[min_col], errors="coerce")
+        approx_std = (max_val - min_val) / 4.0
+        return approx_std / mean.replace(0, np.nan), "range"
+
+    return None, None
+
+
+def _per_step_tokens(df: pd.DataFrame) -> Optional[pd.Series]:
+    tokens_col = "data.perf/total_num_tokens"
+    if tokens_col in df.columns:
+        tokens = pd.to_numeric(df[tokens_col], errors="coerce")
+        diffs = tokens.diff()
+        if diffs.notna().any() and (diffs >= 0).all():
+            return diffs.fillna(tokens)
+        return tokens
+
+    if "data.perf/throughput" in df.columns and "data.perf/time_per_step" in df.columns:
+        throughput = pd.to_numeric(df["data.perf/throughput"], errors="coerce")
+        time_per_step = pd.to_numeric(df["data.perf/time_per_step"], errors="coerce")
+        return throughput * time_per_step
+    return None
 
 
 def _extract_algo_and_gpu(run_name: str) -> Tuple[str, Optional[int]]:
@@ -2137,6 +2195,468 @@ def _quad_throughput_reward_frontier(
     return out_path
 
 
+def _quad_tail_latency_tax_map(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    x_min = None
+    x_max = None
+    y_min = None
+    y_max = None
+    for run in runs:
+        df = run.merged_df
+        if df is None:
+            continue
+        iter_col = "step" if "step" in df.columns else "data.training/global_step"
+        if iter_col not in df.columns:
+            continue
+        work = df.copy()
+        iterations = pd.to_numeric(work[iter_col], errors="coerce")
+        work = work[iterations >= 50].copy()
+        if work.empty:
+            continue
+        cv, _ = _response_length_cv(work)
+        if cv is None:
+            continue
+        if "data.timing_s/gen" in work.columns:
+            gen_time = pd.to_numeric(work["data.timing_s/gen"], errors="coerce")
+        elif "data.timing_per_token_ms/gen" in work.columns:
+            per_token_ms = pd.to_numeric(work["data.timing_per_token_ms/gen"], errors="coerce")
+            gen_time = per_token_ms / 1000.0
+        else:
+            continue
+        tokens = _per_step_tokens(work)
+        if tokens is None:
+            continue
+        y = gen_time / tokens.replace(0, np.nan)
+        x = cv
+        mask = x.notna() & y.notna()
+        if not mask.any():
+            continue
+        x = x[mask]
+        y = y[mask]
+        x_min = x.min() if x_min is None else min(x_min, x.min())
+        x_max = x.max() if x_max is None else max(x_max, x.max())
+        y_min = y.min() if y_min is None else min(y_min, y.min())
+        y_max = y.max() if y_max is None else max(y_max, y.max())
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((8, 6))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = TailLatencyTaxMapPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        if x_min is not None and x_max is not None:
+            ax.set_xlim(x_min, x_max)
+        if y_min is not None and y_max is not None:
+            ax.set_ylim(y_min, y_max)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{TailLatencyTaxMapPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_entropy_mfu_collapse(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    x_min = None
+    x_max = None
+    y1_min = None
+    y1_max = None
+    y2_min = None
+    y2_max = None
+    for run in runs:
+        df = run.merged_df
+        if df is None:
+            continue
+        iter_col = "step" if "step" in df.columns else "data.training/global_step"
+        if iter_col not in df.columns:
+            continue
+        x = pd.to_numeric(df[iter_col], errors="coerce")
+        entropy = pd.to_numeric(df.get("data.actor/entropy"), errors="coerce")
+        mfu = pd.to_numeric(df.get("data.perf/mfu/actor"), errors="coerce")
+        mask = x.notna() & entropy.notna() & mfu.notna()
+        if not mask.any():
+            continue
+        x = x[mask]
+        entropy = entropy[mask]
+        mfu = mfu[mask]
+        x_min = x.min() if x_min is None else min(x_min, x.min())
+        x_max = x.max() if x_max is None else max(x_max, x.max())
+        y1_min = entropy.min() if y1_min is None else min(y1_min, entropy.min())
+        y1_max = entropy.max() if y1_max is None else max(y1_max, entropy.max())
+        y2_min = mfu.min() if y2_min is None else min(y2_min, mfu.min())
+        y2_max = mfu.max() if y2_max is None else max(y2_max, mfu.max())
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((10, 5))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = EntropyMfuCollapsePlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        if x_min is not None and x_max is not None:
+            ax.set_xlim(x_min, x_max)
+        if y1_min is not None and y1_max is not None:
+            ax.set_ylim(y1_min, y1_max)
+        # align twin axis limits if present
+        twins = [a for a in fig.axes if a is not ax and a.get_shared_x_axes().joined(ax, a)]
+        if twins:
+            for twin in twins:
+                if y2_min is not None and y2_max is not None:
+                    twin.set_ylim(y2_min, y2_max)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{EntropyMfuCollapsePlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_clock_imbalance_map(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    x_min = None
+    x_max = None
+    y_min = None
+    y_max = None
+    for run in runs:
+        df = run.merged_df
+        ann = run.annotated_df
+        if df is None or ann is None:
+            continue
+        iter_col = "step" if "step" in df.columns else "data.training/global_step"
+        if iter_col not in df.columns:
+            continue
+        max_col = next((c for c in df.columns if "response_length" in c and c.endswith("/max")), None)
+        min_col = next((c for c in df.columns if "response_length" in c and c.endswith("/min")), None)
+        mean_col = next((c for c in df.columns if "response_length" in c and c.endswith("/mean")), None)
+        if not (max_col and min_col and mean_col):
+            continue
+        iterations = pd.to_numeric(df[iter_col], errors="coerce")
+        max_val = pd.to_numeric(df[max_col], errors="coerce")
+        min_val = pd.to_numeric(df[min_col], errors="coerce")
+        mean_val = pd.to_numeric(df[mean_col], errors="coerce")
+        imbalance = (max_val - min_val) / mean_val.replace(0, np.nan)
+
+        if "operation" not in ann.columns or "iteration" not in ann.columns or "sm_clock_mhz" not in ann.columns:
+            continue
+        work = ann.copy()
+        algo = _algo_label_from_run_name(run.run_name)
+        op_target = "gen_max" if algo == "ReMax" else "gen"
+        work = work[work["operation"] == op_target].copy()
+        work["iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+        work["sm_clock_mhz"] = pd.to_numeric(work["sm_clock_mhz"], errors="coerce")
+        work = work.dropna(subset=["iteration", "sm_clock_mhz"])
+        if work.empty:
+            continue
+        sm_clock = work.groupby("iteration")["sm_clock_mhz"].mean()
+
+        plot_df = pd.DataFrame({"iteration": iterations, "imbalance": imbalance}).dropna()
+        plot_df = plot_df.merge(sm_clock.rename("sm_clock_mhz"), left_on="iteration", right_index=True, how="inner")
+        if plot_df.empty:
+            continue
+        x = plot_df["imbalance"]
+        y = plot_df["sm_clock_mhz"]
+        x_min = x.min() if x_min is None else min(x_min, x.min())
+        x_max = x.max() if x_max is None else max(x_max, x.max())
+        y_min = y.min() if y_min is None else min(y_min, y.min())
+        y_max = y.max() if y_max is None else max(y_max, y.max())
+
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((8, 6))
+    axes_list = []
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = ClockImbalanceMapPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        if x_min is not None and x_max is not None:
+            ax.set_xlim(x_min, x_max)
+        if y_min is not None and y_max is not None:
+            ax.set_ylim(y_min, y_max)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{ClockImbalanceMapPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_boost_headroom_histogram(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((9, 5))
+    axes_list = []
+    x_min = None
+    x_max = None
+    for run in runs:
+        df = run.annotated_df
+        if df is None or "operation" not in df.columns or "sm_clock_mhz" not in df.columns:
+            continue
+        vals = pd.to_numeric(df.loc[df["operation"] == "update_actor", "sm_clock_mhz"], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        x_min = vals.min() if x_min is None else min(x_min, vals.min())
+        x_max = vals.max() if x_max is None else max(x_max, vals.max())
+
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = BoostHeadroomHistogramPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        ax.set_xlim(1000, 1600)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{BoostHeadroomHistogramPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_critic_intensity_map(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, outer = _create_quad_figure((9, 6))
+    axes_list = []
+    x_min = None
+    x_max = None
+    y_max = None
+    for run in runs:
+        df = run.annotated_df
+        timings = run.timings_df
+        if df is None or timings is None or timings.empty:
+            continue
+        if "timestamp_aligned_unix" not in df.columns or "power_draw_w" not in df.columns:
+            continue
+        power_df = df.copy()
+        power_df["timestamp_aligned_unix"] = pd.to_numeric(power_df["timestamp_aligned_unix"], errors="coerce")
+        power_df["power_draw_w"] = pd.to_numeric(power_df["power_draw_w"], errors="coerce")
+        power_df = power_df.dropna(subset=["timestamp_aligned_unix", "power_draw_w"])
+        if power_df.empty:
+            continue
+
+        def add_window(dur_s: float, start: float, end: float) -> None:
+            nonlocal x_min, x_max, y_max
+            if dur_s <= 0:
+                return
+            window = power_df[(power_df["timestamp_aligned_unix"] >= start) & (power_df["timestamp_aligned_unix"] <= end)]
+            if window.empty:
+                return
+            peak = window["power_draw_w"].max()
+            dur_ms = dur_s * 1000.0
+            x_min = dur_ms if x_min is None else min(x_min, dur_ms)
+            x_max = dur_ms if x_max is None else max(x_max, dur_ms)
+            y_max = peak if y_max is None else max(y_max, peak)
+
+        for _, row in timings.iterrows():
+            phase = row.get("phase")
+            ts = row.get("timestamp")
+            if ts is None:
+                continue
+            ts = float(ts)
+            if phase == "rl_policy" and pd.notna(row.get("values")):
+                reward = float(row.get("reward", 0.0) or 0.0)
+                old_log_prob = float(row.get("old_log_prob", 0.0) or 0.0)
+                dur = float(row.get("values") or 0.0)
+                start = ts + reward + old_log_prob
+                end = start + dur
+                add_window(dur, start, end)
+            if phase == "training":
+                if pd.notna(row.get("update_critic")):
+                    dur = float(row.get("update_critic") or 0.0)
+                    start = ts
+                    end = start + dur
+                    add_window(dur, start, end)
+                if pd.notna(row.get("update_actor")):
+                    dur = float(row.get("update_actor") or 0.0)
+                    start = ts + float(row.get("update_critic", 0.0) or 0.0)
+                    end = start + dur
+                    add_window(dur, start, end)
+
+    for idx, run in enumerate(runs):
+        axes = _make_inner_axes(fig, outer, idx, 1, 1)
+        plotter = CriticIntensityMapPlotter(run, output_dir, theme)
+        plotter.draw(fig, axes)
+        ax = np.ravel(axes)[0]
+        if x_min is not None and x_max is not None:
+            pad = max(5.0, (x_max - x_min) * 0.05)
+            ax.set_xlim(x_min - pad, x_max + pad)
+        if y_max is not None and np.isfinite(y_max) and y_max > 0:
+            ax.set_ylim(0, y_max * 1.05)
+        axes_list.append(axes)
+
+    _finalize_quad(fig, axes_list)
+    for run, axes in zip(runs, axes_list):
+        _add_quadrant_title(fig, axes, get_clean_label(run.run_name))
+
+    out_path = output_dir / f"{CriticIntensityMapPlotter.plot_name}_quad_view.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
+def _quad_phase_to_phase_stability(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    _combined_phase_to_phase_stability(runs, output_dir, theme, style_config=style_config)
+    return None
+
+
+def _combined_phase_to_phase_stability(
+    runs: Sequence[RunPaths],
+    output_dir: Path,
+    theme: ThemeConfig,
+    style_config: Optional[RunStyleConfig] = None,
+) -> Optional[Path]:
+    apply_theme(theme)
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 5))
+
+    frames = []
+    algo_order = ["PPO", "GRPO", "ReMax"]
+    transition_order = ["Policy to Training", "Policy to Rollout"]
+    for run in runs:
+        df = run.annotated_df
+        if df is None or df.empty:
+            continue
+        if "phase_name" not in df.columns or "iteration" not in df.columns:
+            continue
+        if "sm_clock_mhz" not in df.columns:
+            continue
+
+        work = df.copy()
+        work["iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+        work["sm_clock_mhz"] = pd.to_numeric(work["sm_clock_mhz"], errors="coerce")
+        work = work.dropna(subset=["iteration", "sm_clock_mhz"])
+        if work.empty:
+            continue
+
+        algo_label, _ = _extract_algo_and_gpu(run.run_name)
+        algo = algo_label if algo_label is not None else _algo_label_from_run_name(run.run_name)
+        if algo not in algo_order:
+            continue
+
+        phase_means = (
+            work[work["phase_name"].isin(["rl_policy", "training", "rollout"])]
+            .groupby(["iteration", "phase_name"])["sm_clock_mhz"]
+            .mean()
+            .unstack("phase_name")
+        )
+        joined = phase_means.dropna(subset=["rl_policy", "training", "rollout"])
+        if joined.empty:
+            continue
+
+        delta_a = (joined["rl_policy"] - joined["training"]).abs()
+        delta_b = (joined["rl_policy"] - joined["rollout"]).abs()
+        frames.append(
+            pd.DataFrame(
+                {
+                    "Algorithm": [algo] * (len(delta_a) + len(delta_b)),
+                    "Transition": (["Policy to Training"] * len(delta_a)) + (["Policy to Rollout"] * len(delta_b)),
+                    "Delta": np.concatenate([delta_a.values, delta_b.values]),
+                }
+            )
+        )
+
+    if not frames:
+        ax.set_title("Phase-to-Phase Stability (missing data)")
+    else:
+        combined = pd.concat(frames, ignore_index=True)
+        transition_palette = {
+            "Policy to Training": "#2980b9",
+            "Policy to Rollout": "#27ae60",
+        }
+
+        if sns is not None:
+            sns.boxplot(
+                data=combined,
+                x="Algorithm",
+                y="Delta",
+                hue="Transition",
+                order=[a for a in algo_order if a in set(combined["Algorithm"])],
+                hue_order=transition_order,
+                palette=transition_palette,
+                ax=ax,
+            )
+        else:
+            algo_present = [a for a in algo_order if a in set(combined["Algorithm"])]
+            positions = []
+            data = []
+            labels = []
+            width = 0.35
+            for idx, algo in enumerate(algo_present):
+                base = idx + 1
+                for j, transition in enumerate(transition_order):
+                    vals = combined[(combined["Algorithm"] == algo) & (combined["Transition"] == transition)]["Delta"].values
+                    data.append(vals)
+                    positions.append(base + (j - 0.5) * width)
+                labels.append(algo)
+            ax.boxplot(data, positions=positions, widths=width * 0.9, patch_artist=True)
+            ax.set_xticks(range(1, len(algo_present) + 1))
+            ax.set_xticklabels(labels)
+
+        fig.suptitle("Phase-to-Phase Stability (All Runs)", fontsize=12, fontweight="bold", y=0.98)
+        handles = [Patch(facecolor=transition_palette[t], edgecolor="#2c3e50", label=t) for t in transition_order]
+        fig.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.955),
+            ncol=2,
+            frameon=False,
+            fontsize=QUAD_TICK_SIZE - 1,
+        )
+
+    ax.set_xlabel("Algorithm")
+    ax.set_ylabel("Δ SM Clock (MHz)")
+    ax.grid(True, axis="y", alpha=theme.grid_alpha)
+    fig.subplots_adjust(top=0.80, bottom=0.12)
+
+    out_path = output_dir / f"{PhaseToPhaseStabilityBoxplot.plot_name}_all_runs.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=theme.save_dpi)
+    plt.close(fig)
+    return out_path
+
+
 def _combined_throughput_vs_length(
     runs: Sequence[RunPaths],
     output_dir: Path,
@@ -3031,6 +3551,12 @@ def _quad_plotters() -> Mapping[str, callable]:
         MFUComparisonPlotter.plot_name: _quad_mfu_comparison,
         ThroughputVsLengthPlotter.plot_name: _quad_throughput_vs_length,
         ThroughputRewardFrontierPlotter.plot_name: _quad_throughput_reward_frontier,
+        TailLatencyTaxMapPlotter.plot_name: _quad_tail_latency_tax_map,
+        EntropyMfuCollapsePlotter.plot_name: _quad_entropy_mfu_collapse,
+        ClockImbalanceMapPlotter.plot_name: _quad_clock_imbalance_map,
+        BoostHeadroomHistogramPlotter.plot_name: _quad_boost_headroom_histogram,
+        CriticIntensityMapPlotter.plot_name: _quad_critic_intensity_map,
+        PhaseToPhaseStabilityBoxplot.plot_name: _quad_phase_to_phase_stability,
         HardwareROIPlotter.plot_name: _quad_hardware_roi,
         LearningPricePlotter.plot_name: _quad_learning_price,
         EnergyPerTokenPlotter.plot_name: _quad_energy_per_token,

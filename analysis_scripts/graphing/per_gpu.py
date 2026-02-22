@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import argparse
 import inspect
 import shutil
@@ -21,7 +25,14 @@ if __package__ is None or __package__ == "":  # pragma: no cover
 from .core.base import ThemeConfig
 from .core.loaders import RunPaths, discover_runs, load_annotated_csv, add_gpu_derived_columns
 from .core.style_config import load_style_config
-from .main import DEFAULT_PLOTS, PLOTTERS, resolve_paths, _plots_label
+from .main import (
+    DEFAULT_PLOTS,
+    PLOTTERS,
+    resolve_paths,
+    _plots_label,
+    _ensure_stage_dir,
+    _atomic_archive_move,
+)
 from .analytics import comparisons as comp
 
 
@@ -157,8 +168,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path("/home/cathxhou/projects/verl_research"),
-        help="Repo root (default: /home/cathxhou/projects/verl_research).",
+        default=Path("/n/netscratch/yu_lab/Lab/chou"),
+        help="Scratch root (default: /n/netscratch/yu_lab/Lab/chou).",
     )
     parser.add_argument(
         "--name",
@@ -172,7 +183,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("plots"),
-        help="Root output directory for generated graphs (default: plots_<cleaned_dir_name>).",
+        help="Archive root for generated graphs (default: /n/home08/chou/verl_research).",
     )
     parser.add_argument(
         "--style-config",
@@ -192,7 +203,7 @@ def main() -> None:
     args = parse_args()
     plot_names = [p.strip() for p in str(args.plots).split(",") if p.strip()]
 
-    cleaned_root, output_dir = resolve_paths(args)
+    cleaned_root, archive_root = resolve_paths(args)
     style_config = None
     style_config_path = args.style_config
     if style_config_path is None:
@@ -218,7 +229,9 @@ def main() -> None:
     for run_list in per_gpu_runs.values():
         bounds_runs.extend(run_list)
 
-    per_gpu_dir = output_dir / "per_GPU"
+    stage_dir = _ensure_stage_dir(cleaned_root)
+
+    per_gpu_dir = stage_dir / "per_GPU"
     per_gpu_dir.mkdir(parents=True, exist_ok=True)
 
     plotter_map = {k: v for k, v in PLOTTERS.items() if k in plot_names}
@@ -242,6 +255,17 @@ def main() -> None:
             leftover.unlink()
         temp_dir.rmdir()
     comp._BOUNDS_REFERENCE_RUNS = None
+
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+
+    label = _plots_label(cleaned_root)
+    archive_dir = archive_root / f"plots_{label}"
+    if archive_dir.exists():
+        shutil.rmtree(archive_dir)
+    archived = _atomic_archive_move(stage_dir, archive_dir)
+    print(f"\nArchived per-GPU plots to: {archived}")
 
 
 if __name__ == "__main__":

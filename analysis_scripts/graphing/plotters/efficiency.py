@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+import matplotlib
+
+matplotlib.use("Agg")
+
+from typing import Sequence, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,6 +20,54 @@ except Exception:  # pragma: no cover
 
 from ..core.base import BasePlotter, OPERATION_COLORS, EXCLUDED_OPERATIONS, format_title
 from ..core.loaders import compute_sample_durations_seconds
+
+
+def _algo_label(run_name: str) -> str:
+    parts = [p for p in run_name.lower().split("_") if p]
+    for token in parts:
+        if token == "ppo":
+            return "PPO"
+        if token == "grpo":
+            return "GRPO"
+        if token == "remax":
+            return "ReMax"
+    return "Unknown"
+
+
+def _response_length_cv(df: pd.DataFrame) -> Tuple[Optional[pd.Series], Optional[str]]:
+    mean_col = next((c for c in df.columns if "response_length" in c and c.endswith("/mean")), None)
+    std_col = next((c for c in df.columns if "response_length" in c and c.endswith("/std")), None)
+    if std_col and mean_col:
+        mean = pd.to_numeric(df[mean_col], errors="coerce")
+        std = pd.to_numeric(df[std_col], errors="coerce")
+        return std / mean.replace(0, np.nan), "std"
+
+    max_col = next((c for c in df.columns if "response_length" in c and c.endswith("/max")), None)
+    min_col = next((c for c in df.columns if "response_length" in c and c.endswith("/min")), None)
+    if mean_col and max_col and min_col:
+        mean = pd.to_numeric(df[mean_col], errors="coerce")
+        max_val = pd.to_numeric(df[max_col], errors="coerce")
+        min_val = pd.to_numeric(df[min_col], errors="coerce")
+        approx_std = (max_val - min_val) / 4.0
+        return approx_std / mean.replace(0, np.nan), "range"
+
+    return None, None
+
+
+def _per_step_tokens(df: pd.DataFrame) -> Optional[pd.Series]:
+    tokens_col = "data.perf/total_num_tokens"
+    if tokens_col in df.columns:
+        tokens = pd.to_numeric(df[tokens_col], errors="coerce")
+        diffs = tokens.diff()
+        if diffs.notna().any() and (diffs >= 0).all():
+            return diffs.fillna(tokens)
+        return tokens
+
+    if "data.perf/throughput" in df.columns and "data.perf/time_per_step" in df.columns:
+        throughput = pd.to_numeric(df["data.perf/throughput"], errors="coerce")
+        time_per_step = pd.to_numeric(df["data.perf/time_per_step"], errors="coerce")
+        return throughput * time_per_step
+    return None
 
 
 class SweepMetricsPlotter(BasePlotter):
@@ -529,6 +581,463 @@ class BottleneckEvolutionPlotter(BasePlotter):
             )
         ax.grid(True, axis="x", alpha=self.theme.grid_alpha)
         ax.legend(loc="upper right")
+
+
+class TailLatencyTaxMapPlotter(BasePlotter):
+    """Tail-Latency Tax Map: response length CV vs gen time per token."""
+
+    plot_name = "tail_latency_tax_map"
+    plot_title = "Tail-Latency Tax Map"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(9, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+
+        df = self.merged_df.copy()
+        iter_col = "step" if "step" in df.columns else "data.training/global_step"
+        if iter_col not in df.columns:
+            ax.set_title("Missing iteration column.")
+            return
+
+        iterations = pd.to_numeric(df[iter_col], errors="coerce")
+        df = df[iterations >= 50].copy()
+        if df.empty:
+            ax.set_title("No data after iteration 50.")
+            return
+
+        cv, cv_method = _response_length_cv(df)
+        if cv is None:
+            ax.set_title("Missing response length stats for CV.")
+            return
+
+        if "data.timing_s/gen" in df.columns:
+            gen_time = pd.to_numeric(df["data.timing_s/gen"], errors="coerce")
+        elif "data.timing_per_token_ms/gen" in df.columns:
+            per_token_ms = pd.to_numeric(df["data.timing_per_token_ms/gen"], errors="coerce")
+            gen_time = per_token_ms / 1000.0
+        else:
+            ax.set_title("Missing gen subphase timing.")
+            return
+
+        tokens = _per_step_tokens(df)
+        if tokens is None:
+            ax.set_title("Missing total token counts.")
+            return
+
+        y = gen_time / tokens.replace(0, np.nan)
+        x = cv
+
+        algo = _algo_label(self.run_paths.run_name)
+        plot_df = pd.DataFrame(
+            {
+                "cv": x,
+                "gen_time_per_token": y,
+            }
+        ).dropna()
+
+        if plot_df.empty:
+            ax.set_title("No valid CV/gen-time data.")
+            return
+
+        color_map = {"PPO": "#2980b9", "GRPO": "#27ae60", "ReMax": "#e67e22", "Unknown": "#7f8c8d"}
+        ax.scatter(
+            plot_df["cv"],
+            plot_df["gen_time_per_token"],
+            s=28,
+            alpha=0.75,
+            color=color_map.get(algo, "#7f8c8d"),
+            label=algo,
+        )
+
+        if len(plot_df) >= 2:
+            coeffs = np.polyfit(plot_df["cv"], plot_df["gen_time_per_token"], 1)
+            line_x = np.linspace(plot_df["cv"].min(), plot_df["cv"].max(), 100)
+            line_y = coeffs[0] * line_x + coeffs[1]
+            ax.plot(line_x, line_y, color="#2c3e50", linewidth=1.6, alpha=0.9)
+
+        x_label = "Sequence Length CV"
+        if cv_method == "range":
+            x_label += " (approx)"
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Gen Time per Token (s/token)")
+        ax.set_title(self.plot_title)
+        ax.grid(True, alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
+class ClockImbalanceMapPlotter(BasePlotter):
+    """Clock speed vs batch imbalance using response length spread."""
+
+    plot_name = "clock_imbalance_map"
+    plot_title = "Clock Speed vs Batch Imbalance"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(9, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+
+        df = self.merged_df.copy()
+        iter_col = "step" if "step" in df.columns else "data.training/global_step"
+        if iter_col not in df.columns:
+            ax.set_title("Missing iteration column.")
+            return
+
+        max_col = next((c for c in df.columns if "response_length" in c and c.endswith("/max")), None)
+        min_col = next((c for c in df.columns if "response_length" in c and c.endswith("/min")), None)
+        mean_col = next((c for c in df.columns if "response_length" in c and c.endswith("/mean")), None)
+        if not (max_col and min_col and mean_col):
+            ax.set_title("Missing response length stats.")
+            return
+
+        iterations = pd.to_numeric(df[iter_col], errors="coerce")
+        max_val = pd.to_numeric(df[max_col], errors="coerce")
+        min_val = pd.to_numeric(df[min_col], errors="coerce")
+        mean_val = pd.to_numeric(df[mean_col], errors="coerce")
+        imbalance = (max_val - min_val) / mean_val.replace(0, np.nan)
+
+        if "iteration" not in self.annotated_df.columns:
+            ax.set_title("Missing iteration in annotated CSV.")
+            return
+        if "sm_clock_mhz" not in self.annotated_df.columns:
+            ax.set_title("Missing sm_clock_mhz in annotated CSV.")
+            return
+
+        work = self.annotated_df.copy()
+        if "operation" in work.columns:
+            op_target = "gen_max" if _algo_label(self.run_paths.run_name) == "ReMax" else "gen"
+            work = work[work["operation"] == op_target].copy()
+        else:
+            ax.set_title("Missing operation in annotated CSV.")
+            return
+        work["iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+        work["sm_clock_mhz"] = pd.to_numeric(work["sm_clock_mhz"], errors="coerce")
+        work = work.dropna(subset=["iteration", "sm_clock_mhz"])
+        if work.empty:
+            ax.set_title("No rollout-phase clock data.")
+            return
+
+        sm_clock = work.groupby("iteration")["sm_clock_mhz"].mean()
+
+        plot_df = pd.DataFrame(
+            {
+                "iteration": iterations,
+                "imbalance": imbalance,
+            }
+        ).dropna()
+        plot_df = plot_df.merge(
+            sm_clock.rename("sm_clock_mhz"),
+            left_on="iteration",
+            right_index=True,
+            how="inner",
+        )
+
+        if plot_df.empty:
+            ax.set_title("No matching imbalance/clock data.")
+            return
+
+        algo = _algo_label(self.run_paths.run_name)
+        color_map = {"PPO": "#2980b9", "GRPO": "#27ae60", "ReMax": "#e67e22", "Unknown": "#7f8c8d"}
+        ax.scatter(
+            plot_df["imbalance"],
+            plot_df["sm_clock_mhz"],
+            s=28,
+            alpha=0.75,
+            color=color_map.get(algo, "#7f8c8d"),
+            label=algo,
+        )
+
+        if len(plot_df) >= 2:
+            coeffs = np.polyfit(plot_df["imbalance"], plot_df["sm_clock_mhz"], 1)
+            line_x = np.linspace(plot_df["imbalance"].min(), plot_df["imbalance"].max(), 100)
+            line_y = coeffs[0] * line_x + coeffs[1]
+            ax.plot(line_x, line_y, color="#2c3e50", linewidth=1.6, alpha=0.9)
+
+        ax.set_xlabel("Response Length Imbalance (max-min)/mean")
+        ax.set_ylabel("Mean SM Clock (MHz) during rollout")
+        ax.set_title(self.plot_title)
+        ax.grid(True, alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
+class BoostHeadroomHistogramPlotter(BasePlotter):
+    """Density plot of SM clock during update_actor to show boost headroom."""
+
+    plot_name = "boost_headroom_histogram"
+    plot_title = "Boost Headroom (Update Actor)"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(9, 5))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        df = self.annotated_df
+        if "operation" not in df.columns:
+            ax.set_title("Missing operation in annotated CSV.")
+            return
+        if "sm_clock_mhz" not in df.columns:
+            ax.set_title("Missing sm_clock_mhz in annotated CSV.")
+            return
+
+        work = df[df["operation"] == "update_actor"].copy()
+        work["sm_clock_mhz"] = pd.to_numeric(work["sm_clock_mhz"], errors="coerce")
+        work = work.dropna(subset=["sm_clock_mhz"])
+        if work.empty:
+            ax.set_title("No update_actor clock data.")
+            return
+
+        algo = _algo_label(self.run_paths.run_name)
+        color_map = {"PPO": "#2980b9", "GRPO": "#27ae60", "ReMax": "#e67e22", "Unknown": "#7f8c8d"}
+        color = color_map.get(algo, "#7f8c8d")
+
+        vals = work["sm_clock_mhz"].to_numpy()
+        bins = np.linspace(1300.0, 1500.0, 31)
+        hist, edges = np.histogram(vals, bins=bins, density=True)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        widths = np.diff(edges)
+        ax.bar(
+            centers,
+            hist,
+            width=widths,
+            color=color,
+            alpha=0.75,
+            edgecolor="#2c3e50",
+            linewidth=0.4,
+            label=algo,
+        )
+
+        ax.set_xlabel("SM Clock (MHz)")
+        ax.set_ylabel("Density")
+        ax.set_title(self.plot_title)
+        ax.ticklabel_format(axis="x", style="plain", useOffset=False)
+        ax.grid(True, alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
+class CriticIntensityMapPlotter(BasePlotter):
+    """Subphase duration vs peak power for critic/actor subphases."""
+
+    plot_name = "critic_intensity_map"
+    plot_title = "Critic Intensity Map"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(9, 6))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.timings_df is None or self.timings_df.empty:
+            ax.set_title("Missing cleaned phase timings JSONL.")
+            return
+        if "timestamp_aligned_unix" not in self.annotated_df.columns:
+            ax.set_title("Missing timestamp_aligned_unix in annotated CSV.")
+            return
+        if "power_draw_w" not in self.annotated_df.columns:
+            ax.set_title("Missing power_draw_w in annotated CSV.")
+            return
+
+        power_df = self.annotated_df.copy()
+        power_df["timestamp_aligned_unix"] = pd.to_numeric(power_df["timestamp_aligned_unix"], errors="coerce")
+        power_df["power_draw_w"] = pd.to_numeric(power_df["power_draw_w"], errors="coerce")
+        power_df = power_df.dropna(subset=["timestamp_aligned_unix", "power_draw_w"])
+        if power_df.empty:
+            ax.set_title("No power readings available.")
+            return
+
+        series = {"values": [], "update_critic": [], "update_actor": []}
+
+        for _, row in self.timings_df.iterrows():
+            phase = row.get("phase")
+            ts = row.get("timestamp")
+            if ts is None:
+                continue
+            ts = float(ts)
+
+            if phase == "rl_policy" and pd.notna(row.get("values")):
+                reward = float(row.get("reward", 0.0) or 0.0)
+                old_log_prob = float(row.get("old_log_prob", 0.0) or 0.0)
+                dur = float(row.get("values") or 0.0)
+                start = ts + reward + old_log_prob
+                end = start + dur
+                series["values"].append((dur * 1000.0, start, end))
+
+            if phase == "training":
+                if pd.notna(row.get("update_critic")):
+                    dur = float(row.get("update_critic") or 0.0)
+                    start = ts
+                    end = start + dur
+                    series["update_critic"].append((dur * 1000.0, start, end))
+                if pd.notna(row.get("update_actor")):
+                    dur = float(row.get("update_actor") or 0.0)
+                    start = ts + float(row.get("update_critic", 0.0) or 0.0)
+                    end = start + dur
+                    series["update_actor"].append((dur * 1000.0, start, end))
+
+        color_map = {
+            "values": "#8e44ad",
+            "update_critic": "#e67e22",
+            "update_actor": "#2980b9",
+        }
+
+        plotted = 0
+        for name, windows in series.items():
+            points = []
+            for dur_ms, start, end in windows:
+                window = power_df[(power_df["timestamp_aligned_unix"] >= start) & (power_df["timestamp_aligned_unix"] <= end)]
+                if window.empty:
+                    continue
+                peak_power = window["power_draw_w"].max()
+                points.append((dur_ms, peak_power))
+            if not points:
+                continue
+            x_vals = [p[0] for p in points]
+            y_vals = [p[1] for p in points]
+            ax.scatter(x_vals, y_vals, s=26, alpha=0.75, color=color_map[name], label=name)
+            plotted += 1
+
+        if plotted == 0:
+            ax.set_title("No matching timing/power windows.")
+            return
+
+        ax.set_xlabel("Subphase Duration (ms)")
+        ax.set_ylabel("Peak Power (W)")
+        ax.set_title(self.plot_title)
+        ax.grid(True, alpha=self.theme.grid_alpha)
+        ax.legend(loc="upper right")
+
+
+class PhaseToPhaseStabilityBoxplot(BasePlotter):
+    """Boxplot of |avg clock(update_actor) - avg clock(gen)| per iteration."""
+
+    plot_name = "phase_to_phase_stability"
+    plot_title = "Phase-to-Phase Stability"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(8, 5))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        df = self.annotated_df
+        if "operation" not in df.columns or "iteration" not in df.columns:
+            ax.set_title("Missing operation or iteration in annotated CSV.")
+            return
+        if "sm_clock_mhz" not in df.columns:
+            ax.set_title("Missing sm_clock_mhz in annotated CSV.")
+            return
+
+        work = df.copy()
+        work["iteration"] = pd.to_numeric(work["iteration"], errors="coerce")
+        work["sm_clock_mhz"] = pd.to_numeric(work["sm_clock_mhz"], errors="coerce")
+        work = work.dropna(subset=["iteration", "sm_clock_mhz"])
+        if work.empty:
+            ax.set_title("No clock data.")
+            return
+
+        algo = _algo_label(self.run_paths.run_name)
+        gen_op = "gen_max" if algo == "ReMax" else "gen"
+
+        gen = work[work["operation"] == gen_op]
+        upd = work[work["operation"] == "update_actor"]
+        if gen.empty or upd.empty:
+            ax.set_title("Missing gen/update_actor data.")
+            return
+
+        gen_mean = gen.groupby("iteration")["sm_clock_mhz"].mean()
+        upd_mean = upd.groupby("iteration")["sm_clock_mhz"].mean()
+        joined = pd.concat([gen_mean.rename("gen"), upd_mean.rename("update")], axis=1).dropna()
+        if joined.empty:
+            ax.set_title("No overlapping iterations.")
+            return
+
+        delta = (joined["update"] - joined["gen"]).abs()
+        if sns is not None:
+            sns.boxplot(
+                data=pd.DataFrame({"Algorithm": [algo] * len(delta), "Delta": delta.values}),
+                x="Algorithm",
+                y="Delta",
+                color="#bdc3c7",
+                ax=ax,
+            )
+        else:
+            ax.boxplot([delta.values], labels=[algo])
+
+        ax.set_xlabel("Algorithm")
+        ax.set_ylabel("Δ SM Clock (MHz)")
+        ax.set_title(self.plot_title)
+        ax.grid(True, axis="y", alpha=self.theme.grid_alpha)
+
+
+class EntropyMfuCollapsePlotter(BasePlotter):
+    """Entropy vs MFU over step with dual y-axes."""
+
+    plot_name = "entropy_mfu_collapse"
+    plot_title = "Entropy vs MFU Collapse"
+
+    def create_figure(self) -> Tuple[plt.Figure, np.ndarray]:
+        fig, axes = plt.subplots(1, 1, figsize=(10, 5))
+        suptitle, _ = format_title(self.run_paths.run_name, self.plot_title)
+        fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+        return fig, np.asarray([axes])
+
+    def draw(self, fig: plt.Figure, axes: np.ndarray) -> None:
+        ax = axes[0]
+        if self.merged_df is None:
+            ax.set_title("Missing merged sweep CSV.")
+            return
+
+        df = self.merged_df.copy()
+        iter_col = "step" if "step" in df.columns else "data.training/global_step"
+        if iter_col not in df.columns:
+            ax.set_title("Missing iteration column.")
+            return
+
+        x = pd.to_numeric(df[iter_col], errors="coerce")
+        entropy = pd.to_numeric(df.get("data.actor/entropy"), errors="coerce")
+        mfu = pd.to_numeric(df.get("data.perf/mfu/actor"), errors="coerce")
+
+        mask = x.notna() & entropy.notna() & mfu.notna()
+        x = x[mask]
+        entropy = entropy[mask]
+        mfu = mfu[mask]
+
+        if x.empty:
+            ax.set_title("No entropy/MFU data.")
+            return
+
+        ax.plot(x, entropy, color="#8e44ad", linewidth=1.5, label="Actor Entropy")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Actor Entropy", color="#8e44ad")
+        ax.tick_params(axis="y", labelcolor="#8e44ad")
+        ax.grid(True, alpha=self.theme.grid_alpha)
+
+        ax2 = ax.twinx()
+        ax2.plot(x, mfu, color="#2980b9", linewidth=1.5, label="Actor MFU")
+        ax2.set_ylabel("Actor MFU", color="#2980b9")
+        ax2.tick_params(axis="y", labelcolor="#2980b9")
+
+        ax.set_title(self.plot_title)
 
 
 class OperationAggregatePlotter(BasePlotter):
