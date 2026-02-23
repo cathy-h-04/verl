@@ -32,15 +32,34 @@ EXPERIMENT_NAME="${BASE_EXPERIMENT_NAME}_${TIMESTAMP}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PROFILING_DIR="${PROJECT_DIR}/profiling_scripts"
-MONITORING_DIR="${SCRATCH_DIR}/logs"
+export VERL_PROFILER_DIR="$PROFILING_DIR"
+MONITOR_ROOT="${SCRATCH_DIR}/monitoring"
+case "${USE_VALIDATION:-0}" in
+    1|true|TRUE|yes|YES)
+        MONITOR_ROOT="${SCRATCH_DIR}/monitoring_val"
+        ;;
+esac
+MONITORING_DIR="${MONITOR_ROOT}/${EXPERIMENT_NAME}"
 
 mkdir -p "$MONITORING_DIR"
 cd "$PROJECT_DIR"
+
+export VERL_FILE_LOGGER_ROOT="$MONITOR_ROOT"
+export VERL_FILE_LOGGER_PATH="${MONITORING_DIR}/${EXPERIMENT_NAME}.jsonl"
 
 export EXPERIMENT_NAME
 export MONITORING_DIR
 export PROJECT_DIR
 export SCRATCH_DIR
+
+# Persist experiment metadata alongside monitoring outputs (scratch + later migrated)
+echo "$EXPERIMENT_NAME" > "${MONITORING_DIR}/experiment_name.txt"
+if [ -n "${PARAM_HEADER:-}" ] && [ -n "${PARAM_LINE:-}" ]; then
+    {
+        echo "$PARAM_HEADER"
+        echo "$PARAM_LINE"
+    } > "${MONITORING_DIR}/params.txt"
+fi
 
 # Persist the resolved experiment name for Slurm cleanup/migration
 if [ -n "${SLURM_JOB_ID:-}" ]; then
@@ -67,6 +86,13 @@ echo "=========================================="
 cleanup() {
     echo ""
     echo "Cleaning up..."
+
+    # If a stray local run dir exists, migrate it into monitoring
+    if [ -d "${PROJECT_DIR}/${EXPERIMENT_NAME}" ]; then
+        echo "Relocating local outputs from ${PROJECT_DIR}/${EXPERIMENT_NAME} to ${MONITORING_DIR}..."
+        rsync -avz "${PROJECT_DIR}/${EXPERIMENT_NAME}/" "${MONITORING_DIR}/" || true
+        rm -rf "${PROJECT_DIR:?}/${EXPERIMENT_NAME}"
+    fi
 
     if [ "${RAY_MANAGED_BY_SLURM:-0}" = "1" ]; then
         echo "Stopping Ray..."

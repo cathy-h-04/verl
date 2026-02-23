@@ -17,6 +17,7 @@ fi
 # -------------------- Configuration --------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+export PROJECT_DIR
 EXPERIMENT_NAME="${1:-gsm8k_profile}"
 MODEL_NAME="${5:-Qwen/Qwen2.5-7B-Instruct}"
 TOTAL_EPOCHS="${2:-1}"
@@ -26,6 +27,8 @@ POLICY="${6:-ppo}"  # ppo | remax
 NNODES="${7:-1}"
 N_GPUS_PER_NODE="${8:-4}"
 DATASET_NAME="${9:-gsm8k}"
+TOTAL_STEPS="${TOTAL_STEPS:-}"
+SAVE_FREQ="${SAVE_FREQ:-}"
 export EXPERIMENT_NAME
 
 # -------------------- CLI Overrides --------------------
@@ -47,6 +50,19 @@ set -- "${POSITIONAL[@]}"
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
     export RESUME_FROM_CHECKPOINT
     echo "Resume from checkpoint: $RESUME_FROM_CHECKPOINT"
+    if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
+        echo "FATAL: resume_path does not exist: $RESUME_FROM_CHECKPOINT"
+        exit 1
+    fi
+    ACTOR_SEARCH_DIR="$RESUME_FROM_CHECKPOINT"
+    if [ -d "$RESUME_FROM_CHECKPOINT/actor" ]; then
+        ACTOR_SEARCH_DIR="$RESUME_FROM_CHECKPOINT/actor"
+    fi
+    ACTOR_FILE=$(find "$ACTOR_SEARCH_DIR" -type f -name "model_world_size_*_rank_0.pt" | head -1)
+    if [ -z "$ACTOR_FILE" ]; then
+        echo "FATAL: resume_path missing actor/policy weights: $RESUME_FROM_CHECKPOINT"
+        exit 1
+    fi
 fi
 
 # Rollout tensor parallel size
@@ -74,9 +90,13 @@ source verl-env/bin/activate
 
 export PYTHONPATH="${PYTHONPATH:-}:${PROJECT_DIR}/verl"
 export PYTHONUNBUFFERED=1
-# Structured file logging (JSONL) goes to monitoring/<project>/<experiment>.jsonl
-MONITORING_DIR="${MONITORING_DIR:-${SCRATCH_DIR}/logs}"
-export VERL_FILE_LOGGER_ROOT="$MONITORING_DIR"
+# Ensure profiler module path is available for Ray workers.
+export VERL_PROFILER_DIR="${VERL_PROFILER_DIR:-${PROJECT_DIR}/profiling_scripts}"
+# Structured file logging (JSONL) goes to monitoring/<experiment>.jsonl
+MONITORING_DIR="${MONITORING_DIR:-${SCRATCH_DIR}/monitoring/${EXPERIMENT_NAME}}"
+export VERL_FILE_LOGGER_ROOT="$(dirname "$MONITORING_DIR")"
+export VERL_FILE_LOGGER_PATH="${MONITORING_DIR}/${EXPERIMENT_NAME}.jsonl"
+mkdir -p "$MONITORING_DIR"
 
 # Flash attention enabled (requires compatible flash-attn install)
 # export VLLM_DISABLE_FLASHINFER=1  # uncomment if flashinfer causes issues
@@ -161,7 +181,20 @@ esac
 
 RESUME_ARGS=()
 if [ -n "${RESUME_FROM_CHECKPOINT:-}" ]; then
-    RESUME_ARGS+=("trainer.resume_from_checkpoint=$RESUME_FROM_CHECKPOINT")
+    RESUME_ARGS+=("trainer.resume_mode=resume_path")
+    RESUME_ARGS+=("trainer.resume_from_path=$RESUME_FROM_CHECKPOINT")
+fi
+SAVE_ARGS=()
+if [ -n "${SAVE_FREQ:-}" ] && [ "$SAVE_FREQ" -gt 0 ]; then
+    SAVE_ARGS+=("trainer.save_freq=$SAVE_FREQ")
+fi
+RAY_INIT_ARGS=()
+if [ -n "${RAY_ADDRESS:-}" ]; then
+    RAY_INIT_ARGS+=("ray_kwargs.ray_init.num_cpus=null")
+fi
+if [ -n "${RAY_ADDRESS:-}" ] && [ "${#RAY_INIT_ARGS[@]}" -eq 0 ]; then
+    echo "FATAL: ray_kwargs.ray_init.num_cpus must be null when RAY_ADDRESS is set."
+    exit 1
 fi
 
 python3 -m verl.trainer.main_ppo \
@@ -203,8 +236,11 @@ python3 -m verl.trainer.main_ppo \
   trainer.test_freq=0 \
   trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
   trainer.nnodes=$NNODES \
-  trainer.save_freq=-1 \
+  "${RAY_INIT_ARGS[@]}" \
+  ray_kwargs.timeline_json_file="${MONITORING_DIR}/ray_timeline.json" \
+  "${SAVE_ARGS[@]}" \
   trainer.total_epochs=$TOTAL_EPOCHS \
+  ${TOTAL_STEPS:+trainer.total_training_steps=$TOTAL_STEPS} \
   trainer.default_hdfs_dir=null \
   trainer.default_local_dir="$OUTPUT_DIR" \
   +critic.model.override_config.attn_implementation=flash_attention_2 \

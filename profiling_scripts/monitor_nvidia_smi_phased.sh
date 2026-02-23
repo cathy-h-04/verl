@@ -23,8 +23,12 @@ N_GPUS_PER_NODE="${5:-na}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-MONITOR_DIR="${MONITORING_DIR:-$SCRATCH_DIR/logs}"
-EXPERIMENT_MONITOR_DIR="${MONITOR_DIR}/${EXPERIMENT_NAME}"
+MONITOR_DIR="${MONITORING_DIR:-$SCRATCH_DIR/monitoring}"
+if [[ "$MONITOR_DIR" == */"$EXPERIMENT_NAME" ]]; then
+    EXPERIMENT_MONITOR_DIR="$MONITOR_DIR"
+else
+    EXPERIMENT_MONITOR_DIR="${MONITOR_DIR}/${EXPERIMENT_NAME}"
+fi
 mkdir -p "$EXPERIMENT_MONITOR_DIR"
 OUTPUT_FILE="$EXPERIMENT_MONITOR_DIR/${EXPERIMENT_NAME}_phased_${TIMESTAMP}.csv"
 TRAIN_LOG_FILE="${TRAIN_LOG_FILE:-$SCRATCH_DIR/logs/${EXPERIMENT_NAME}.log}"
@@ -39,7 +43,7 @@ project_dir = os.environ.get("PROJECT_DIR", "")
 if project_dir:
     sys.path.insert(0, project_dir)
 
-from profiling_scripts.verl_phase_profiler import PhaseReader
+from profiling_scripts.verl_subphase_profiler import PhaseReader
 
 def main():
     experiment_name = sys.argv[1] if len(sys.argv) > 1 else "default_experiment"

@@ -32,7 +32,11 @@ GRANULARITY="${GRANULARITY:-phase}"
 DATASET_NAME="${DATASET_NAME:-gsm8k}"
 NNODES="${NNODES:-1}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
-USE_VALIDATION="${USE_VALIDATION:-0}"
+USE_VALIDATION="${USE_VALIDATION:-1}"
+VAL_FREQ="${VAL_FREQ:-20}"
+VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-}"
+TOTAL_STEPS="${TOTAL_STEPS:-}"
+SAVE_FREQ="${SAVE_FREQ:-}"
 RESUME_FROM_CHECKPOINT=""
 
 POSITIONAL=()
@@ -54,9 +58,9 @@ if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
     echo "Resume from checkpoint: $RESUME_FROM_CHECKPOINT"
 fi
 
-if [ -n "${SLURM_ARRAY_TASK_ID:-}" ] && [ $# -lt 10 ]; then
-    echo "ERROR: Slurm array task requires 10 params."
-    echo "Expected: BASE_EXPERIMENT_NAME MODEL_NAME EPOCHS POLL_INTERVAL GRANULARITY POLICY NNODES N_GPUS_PER_NODE DATASET_NAME USE_VALIDATION"
+if [ -n "${SLURM_ARRAY_TASK_ID:-}" ] && [ $# -lt 15 ]; then
+    echo "ERROR: Slurm array task requires 15 params."
+    echo "Expected: NAME MODEL EPOCHS POLL GRANULARITY POLICY NODES GPUS DATASET VAL VAL_FREQ VAL_SAMPLES TOTAL_STEPS SAVE_FREQ RESUME_PATH"
     exit 1
 fi
 
@@ -64,7 +68,7 @@ MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct}"
 MODEL_TAG="${MODEL_TAG:-qwen2.5_7b}"
 POLICY="${POLICY:-ppo}"
 
-if [ $# -ge 10 ]; then
+if [ $# -ge 15 ]; then
     BASE_EXPERIMENT_NAME="$1"
     MODEL_NAME="$2"
     EPOCHS="$3"
@@ -75,16 +79,20 @@ if [ $# -ge 10 ]; then
     N_GPUS_PER_NODE="$8"
     DATASET_NAME="$9"
     USE_VALIDATION="${10}"
+    VAL_FREQ="${11}"
+    VAL_MAX_SAMPLES="${12}"
+    TOTAL_STEPS="${13}"
+    SAVE_FREQ="${14}"
+    RESUME_FROM_CHECKPOINT="${15}"
 else
     BASE_EXPERIMENT_NAME="${BASE_EXPERIMENT_PREFIX}_${DATASET_NAME}_${POLICY}_${MODEL_TAG}_${N_GPUS_PER_NODE}gpn"
 fi
 
-TRAIN_SCRIPT="run_verl_train_nonval.sh"
-case "$USE_VALIDATION" in
-    1|true|TRUE|yes|YES)
-        TRAIN_SCRIPT="run_verl_train_val.sh"
-        ;;
-esac
+if [ "${USE_VALIDATION}" != "1" ] && [ "${USE_VALIDATION}" != "true" ] && [ "${USE_VALIDATION}" != "TRUE" ] && [ "${USE_VALIDATION}" != "yes" ] && [ "${USE_VALIDATION}" != "YES" ]; then
+    echo "WARNING: Forcing validation-only runs. Overriding USE_VALIDATION=$USE_VALIDATION to 1."
+    USE_VALIDATION=1
+fi
+TRAIN_SCRIPT="run_verl_train_val.sh"
 
 echo ""
 echo "=== Running: ${BASE_EXPERIMENT_NAME} ==="
@@ -92,9 +100,12 @@ echo "Model: $MODEL_NAME"
 echo "Policy: $POLICY"
 echo "Nodes: $NNODES (gpus per node: $N_GPUS_PER_NODE)"
 echo "Validation: $USE_VALIDATION"
+echo "Val freq: $VAL_FREQ"
+echo "Val max samples: ${VAL_MAX_SAMPLES:-auto}"
 echo "Dataset: $DATASET_NAME"
 
-TRAIN_SCRIPT="$TRAIN_SCRIPT" bash "${PROFILING_DIR}/run_with_phase_monitoring.sh" \
+TRAIN_SCRIPT="$TRAIN_SCRIPT" USE_VALIDATION="$USE_VALIDATION" VAL_FREQ="$VAL_FREQ" VAL_MAX_SAMPLES="$VAL_MAX_SAMPLES" TOTAL_STEPS="$TOTAL_STEPS" SAVE_FREQ="$SAVE_FREQ" RESUME_FROM_CHECKPOINT="$RESUME_FROM_CHECKPOINT" \
+    bash "${PROFILING_DIR}/run_with_phase_monitoring.sh" \
     "$BASE_EXPERIMENT_NAME" \
     "$EPOCHS" \
     "$POLL_INTERVAL" \
