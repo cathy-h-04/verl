@@ -34,6 +34,19 @@ PPO_RAY_RUNTIME_ENV = {
     },
 }
 
+# Environment variables that should be propagated to Ray workers when set.
+# These are required for phase profiling and file-based logging to work in
+# Ray remote processes.
+PPO_RAY_PASSTHROUGH_ENV_VARS = (
+    "EXPERIMENT_NAME",
+    "PROJECT_DIR",
+    "SCRATCH_DIR",
+    "MONITORING_DIR",
+    "VERL_FILE_LOGGER_ROOT",
+    "VERL_FILE_LOGGER_PATH",
+    "VERL_PROFILER_DIR",
+)
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -51,4 +64,8 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    for key in PPO_RAY_PASSTHROUGH_ENV_VARS:
+        value = os.environ.get(key)
+        if value:
+            runtime_env["env_vars"][key] = value
     return runtime_env

@@ -22,6 +22,7 @@ import json
 import os
 import time
 import uuid
+from pathlib import Path
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -64,8 +65,28 @@ from verl.utils.tracking import ValidationGenerationsLogger
 # Phase profiler for energy efficiency tracking (SUB-PHASE VERSION)
 try:
     import sys
-    sys.path.insert(0, '/home/cathxhou/projects/verl_research/profiling_scripts')
+
+    profiler_dir = os.environ.get("VERL_PROFILER_DIR")
+    if not profiler_dir:
+        project_dir = os.environ.get("PROJECT_DIR")
+        if project_dir:
+            profiler_dir = str(Path(project_dir) / "profiling_scripts")
+        else:
+            # Resolve repo root from this file path: verl/trainer/ppo/ray_trainer.py
+            # parents[4] should be the repo root
+            repo_root = None
+            try:
+                repo_root = Path(__file__).resolve().parents[4]
+            except Exception:
+                repo_root = None
+            if repo_root is not None:
+                profiler_dir = str(repo_root / "profiling_scripts")
+
+    if profiler_dir:
+        sys.path.insert(0, profiler_dir)
+
     from verl_subphase_profiler import SubPhaseProfiler as PhaseProfiler
+
     PHASE_PROFILER_AVAILABLE = True
 except ImportError:
     PHASE_PROFILER_AVAILABLE = False
@@ -1029,7 +1050,16 @@ class RayPPOTrainer:
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+            val_timing_raw = {}
+            if self.phase_profiler:
+                self.phase_profiler.mark_phase_start("validation", iteration=self.global_steps)
+            with marked_timer("testing", val_timing_raw, color="green"):
+                val_metrics = self._validate()
+            if self.phase_profiler:
+                self.phase_profiler.mark_phase_end("validation")
+                self.phase_profiler.log_timings(val_timing_raw, "validation", self.global_steps)
+                # Avoid labeling non-validation work as validation.
+                self.phase_profiler.mark_phase_start("other", iteration=self.global_steps)
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             val_payload = {f"val/{k}": v for k, v in val_metrics.items()}
@@ -1312,10 +1342,18 @@ class RayPPOTrainer:
                     and self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
-                    with marked_timer("testing", timing_raw, color="green"):
+                    val_timing_raw = {}
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_start("validation", iteration=self.global_steps)
+                    with marked_timer("testing", val_timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
+                    if self.phase_profiler:
+                        self.phase_profiler.mark_phase_end("validation")
+                        self.phase_profiler.log_timings(val_timing_raw, "validation", self.global_steps)
+                        # Avoid labeling non-validation work as validation.
+                        self.phase_profiler.mark_phase_start("other", iteration=self.global_steps)
                     metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.

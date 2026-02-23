@@ -118,6 +118,19 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
 
+    # Rollout variance telemetry (raw response lengths, no reduction/filters)
+    eps = 1e-8
+    response_length_mean = torch.mean(response_length)
+    response_length_max = torch.max(response_length)
+    response_length_std = torch.std(response_length, unbiased=False)
+    response_length_p50 = torch.quantile(response_length, 0.5)
+    response_length_p95 = torch.quantile(response_length, 0.95)
+    straggler_ratio = response_length_max / (response_length_mean + eps)
+    sync_efficiency = response_length_mean / (response_length_max + eps)
+    bucket_lt_256 = torch.sum(response_length < 256)
+    bucket_256_768 = torch.sum((response_length >= 256) & (response_length <= 768))
+    bucket_gt_768 = torch.sum(response_length > 768)
+
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask
 
@@ -206,6 +219,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        # rollout variance telemetry
+        "rollout/straggler_ratio": straggler_ratio.detach().item(),
+        "rollout/response_length_p50": response_length_p50.detach().item(),
+        "rollout/response_length_p95": response_length_p95.detach().item(),
+        "rollout/response_length_std": response_length_std.detach().item(),
+        "rollout/response_len_bucket_lt_256": bucket_lt_256.detach().item(),
+        "rollout/response_len_bucket_256_768": bucket_256_768.detach().item(),
+        "rollout/response_len_bucket_gt_768": bucket_gt_768.detach().item(),
+        "rollout/sync_efficiency": sync_efficiency.detach().item(),
     }
 
     # multi-turn conversation
