@@ -23,8 +23,17 @@ DEFAULT_OUT_DIR = "monitoring_small_cleaned"
 # Define which operations belong to each phase
 PHASE_OPERATIONS: Dict[str, Set[str]] = {
     "rollout": {
-        "start_profile", "generate_sequences", "generation_timing/max", 
-        "generation_timing/min", "generation_timing/topk_ratio", "gen", "gen_max"
+        "start_profile",
+        "generate_sequences",
+        "generation_timing/max",
+        "generation_timing/min",
+        "generation_timing/median",
+        "generation_timing/p95",
+        "generation_timing/imbalance",
+        "generation_timing/topk_ratio",
+        "comm_s/gen",
+        "gen",
+        "gen_max",
     },
     "rl_policy": {
         "reward", "old_log_prob", "Role.RefPolicy", "values", "adv"
