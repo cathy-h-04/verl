@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/qwen_sys_baseline/runs.json",
+    "index": 1,
+    "name": "qwen_sys_3b_ppo"
+  },
+  "run": {
+    "granularity": "operation",
+    "poll_interval": 0.5,
+    "nnodes": 1,
+    "use_validation": true,
+    "save_freq": 50,
+    "name": "qwen_sys_3b_ppo",
+    "gpus_per_node": 4,
+    "dataset": "gsm8k",
+    "total_steps": 50,
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "resume_path": null,
+    "val_freq": 10,
+    "val_max_samples": 128,
+    "policy": "ppo",
+    "total_epochs": 1,
+    "rollout_n": 1
+  },
+  "train": {
+    "rollout_max_model_len": 2048,
+    "ppo_mini_batch_size": 32,
+    "train_batch_size": 128,
+    "micro_batch_size_per_gpu": 4,
+    "tensor_parallel_size": 1,
+    "log_prob_micro_batch_size": 4,
+    "rollout_max_num_seqs": 64,
+    "gpu_memory_util": 0.5,
+    "enable_grad_checkpointing": true,
+    "rollout_max_batched_tokens": 8192
+  }
+}
