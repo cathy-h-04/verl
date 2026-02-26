@@ -1,0 +1,12 @@
+{
+  "job_name": "smoke-llama",
+  "partition": "gpu_h200",
+  "time": "00:20:00",
+  "nodes": 1,
+  "ntasks_per_node": 1,
+  "gpus_per_node": 1,
+  "cpus_per_task": 8,
+  "mem": "40G",
+  "output": "/n/netscratch/yu_lab/Lab/chou/logs/%A_%a.out",
+  "error": "/n/netscratch/yu_lab/Lab/chou/logs/%A_%a.err"
+}
