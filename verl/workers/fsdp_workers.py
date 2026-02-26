@@ -81,8 +81,17 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
-from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
+from verl.utils.profiler import (
+    DistProfiler,
+    DistProfilerExtension,
+    ProfilerConfig,
+    comm_context,
+    enable_comm_timing,
+    get_comm_timing_stats,
+    log_gpu_memory_usage,
+    simple_timer,
+)
+from verl.utils.profiler.performance import gather_timing_stats, reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
@@ -153,6 +162,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
+        enable_comm_timing()
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -871,24 +881,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
         with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            with comm_context("update_actor", reset=True):
+                data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
-            # perform training
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+                # perform training
+                with Timer(name="update_policy", logger=None) as timer:
+                    metrics = self.actor.update_policy(data=data)
+                delta_time = timer.last
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/actor"] = (
+                    estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                )
+                metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+                metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-            self.actor_lr_scheduler.step()
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self.actor_lr_scheduler.step()
+
+            comm_stats = get_comm_timing_stats()
+            metrics["comm_s/update_actor"] = comm_stats.get("update_actor", 0.0)
+            metrics.update(gather_timing_stats(delta_time, "timing_dist_s/update_actor"))
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
@@ -927,8 +942,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
-        with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+        op_name = prompts.meta_info.get("timing_op", "gen")
+        with comm_context(op_name, reset=True):
+            with simple_timer("generate_sequences", timing_generate):
+                output = self.rollout.generate_sequences(prompts=prompts)
+
+        comm_stats = get_comm_timing_stats()
+        timing_generate[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -936,17 +956,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
+        if op_name == "gen":
+            timing_dist = gather_timing_stats(timing_generate["generate_sequences"], "generation_timing")
+        else:
+            timing_dist = gather_timing_stats(timing_generate["generate_sequences"], f"timing_dist_s/{op_name}")
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
             timing_generate["generate_sequences"]
         )
         timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
-            }
-        )
+        if op_name != "gen":
+            timing_generate.pop("generate_sequences", None)
+        if op_name == "gen":
+            timing_generate.update(
+                {
+                    "generation_timing/max": timing_generate_max,
+                    "generation_timing/min": timing_generate_min,
+                    "generation_timing/topk_ratio": timing_generate_topk_ratio,
+                    **timing_dist,
+                }
+            )
+        else:
+            timing_generate.update(timing_dist)
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")
 
@@ -957,6 +987,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "old_log_prob")
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -975,13 +1006,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
-            with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            with comm_context(op_name, reset=True):
+                with adapter_ctx:
+                    with Timer(name="compute_log_prob", logger=None) as timer:
+                        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            delta_time = timer.last
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -1001,10 +1041,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
+            data.meta_info["timing_op"] = "Role.RefPolicy"
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
-            return data
+            output = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            output.meta_info["timing"] = data.meta_info.get("timing", {})
+            return output
         assert self._is_ref
         # else:
         # otherwise, the class have a standalone ref model
@@ -1015,10 +1057,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            with comm_context("Role.RefPolicy", reset=True):
+                data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
+                with Timer(name="compute_ref_log_prob", logger=None) as timer:
+                    output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            delta_time = timer.last
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info["comm_s/Role.RefPolicy"] = comm_stats.get("Role.RefPolicy", 0.0)
+        timing_info.update(gather_timing_stats(delta_time, "timing_dist_s/Role.RefPolicy"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -1157,6 +1208,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
+        enable_comm_timing()
         self.config: FSDPCriticConfig = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -1486,6 +1538,7 @@ class CriticWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="cyan")
     def compute_values(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "values")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
         micro_batch_size = self.config.forward_micro_batch_size_per_gpu
@@ -1494,10 +1547,19 @@ class CriticWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         # perform forward computation
         with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
-            values = self.critic.compute_values(data=data)
+            with comm_context(op_name, reset=True):
+                data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
+                with Timer(name="compute_values", logger=None) as timer:
+                    values = self.critic.compute_values(data=data)
+            delta_time = timer.last
             output = DataProto.from_dict(tensors={"values": values})
 
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
@@ -1513,18 +1575,23 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         # perform forward computation
         with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
-            with Timer(name="update_critic", logger=None) as timer:
-                metrics = self.critic.update_critic(data=data)
-            delta_time = timer.last
+            with comm_context("update_critic", reset=True):
+                data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
+                with Timer(name="update_critic", logger=None) as timer:
+                    metrics = self.critic.update_critic(data=data)
+                delta_time = timer.last
 
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
 
-            lr = self.critic_lr_scheduler.get_last_lr()[0]
-            metrics["critic/lr"] = lr
-            self.critic_lr_scheduler.step()
+                lr = self.critic_lr_scheduler.get_last_lr()[0]
+                metrics["critic/lr"] = lr
+                self.critic_lr_scheduler.step()
+
+            comm_stats = get_comm_timing_stats()
+            metrics["comm_s/update_critic"] = comm_stats.get("update_critic", 0.0)
+            metrics.update(gather_timing_stats(delta_time, "timing_dist_s/update_critic"))
 
             output = DataProto(batch=None, meta_info={"metrics": metrics})
 
@@ -1874,6 +1941,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
+        op_name = data.meta_info.get("timing_op", "reward")
         # Support all hardwares
         data = data.to(get_device_id())
         if self._do_switch_chat_template:
@@ -1894,17 +1962,22 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         # perform forward computation
         with self.ulysses_sharding_manager:
-            use_dynamic_bsz = self.config.use_dynamic_bsz
-            if use_dynamic_bsz:
-                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
-            else:
-                micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
-            output = []
-            for micro_batch in micro_batches:
-                rm_score = self._forward_micro_batch(micro_batch)
-                output.append(rm_score)
-            scores = torch.cat(output, dim=0)  # (batch_size)
+            with comm_context(op_name, reset=True):
+                with Timer(name="compute_rm_score", logger=None) as timer:
+                    use_dynamic_bsz = self.config.use_dynamic_bsz
+                    if use_dynamic_bsz:
+                        max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                        micro_batches, indices = rearrange_micro_batches(
+                            batch=rm_data.batch, max_token_len=max_token_len
+                        )
+                    else:
+                        micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+                    output = []
+                    for micro_batch in micro_batches:
+                        rm_score = self._forward_micro_batch(micro_batch)
+                        output.append(rm_score)
+                    scores = torch.cat(output, dim=0)  # (batch_size)
+            delta_time = timer.last
 
             if use_dynamic_bsz:
                 indices = list(itertools.chain.from_iterable(indices))
@@ -1916,6 +1989,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             # Note that this is only the scores, may not be the final rewards used to train RL
             output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
 
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
         if self.world_size > 1 and fsdp_version(self.reward_module) == 1:

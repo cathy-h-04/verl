@@ -35,7 +35,15 @@ from verl.utils.device import (
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, log_gpu_memory_usage
+from verl.utils.profiler import (
+    DistProfiler,
+    DistProfilerExtension,
+    comm_context,
+    enable_comm_timing,
+    get_comm_timing_stats,
+    log_gpu_memory_usage,
+)
+from verl.utils.profiler.performance import gather_timing_stats, reduce_timing
 from verl.utils.py_functional import append_to_dict
 from verl.workers.config import ActorConfig, CriticConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
@@ -62,6 +70,7 @@ class ActorWorker(Worker, DistProfilerExtension):
         )
 
         initialize_global_process_group_ray(timeout_second=None)
+        enable_comm_timing()
 
         self.loss_fn = partial(ppo_loss, config=self.config)
 
@@ -111,6 +120,7 @@ class ActorWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "old_log_prob")
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         data.meta_info["use_fused_kernels"] = self.config.use_fused_kernels
         if "calculate_entropy" not in data.meta_info:
@@ -122,11 +132,20 @@ class ActorWorker(Worker, DistProfilerExtension):
         else:
             data.meta_info["micro_batch_size_per_gpu"] = self.config.ppo_infer_micro_batch_size_per_gpu
 
-        with self.engine.eval_mode():
-            # TODO: make worker API to accept TensorDict as well
-            data = data.to_tensordict()
-            data = left_right_2_no_padding(data)
-            output = self.engine.infer_batch(data)
+        with comm_context(op_name, reset=True):
+            with self.engine.eval_mode():
+                # TODO: make worker API to accept TensorDict as well
+                data = data.to_tensordict()
+                data = left_right_2_no_padding(data)
+                with Timer(name="compute_log_prob", logger=None) as timer:
+                    output = self.engine.infer_batch(data)
+        delta_time = timer.last
+
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
 
         if self.engine.is_mp_src_rank_with_outputs():
             output = output["model_output"]
@@ -140,6 +159,7 @@ class ActorWorker(Worker, DistProfilerExtension):
 
             # in megatron, only last pp contains valid data and returned to the single controller
             output = DataProto.from_dict(tensors=tensors)
+            output.meta_info["timing"] = timing_info
             output = output.to("cpu")
 
         return output if self.engine.is_mp_src_rank_with_outputs() else None
@@ -159,36 +179,41 @@ class ActorWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
         # perform forward computation
-        with self.engine.train_mode():
-            dataloader = data.make_iterator(
-                mini_batch_size=self.ppo_mini_batch_size_per_dp,
-                epochs=self.config.ppo_epochs,
-                seed=self.config.data_loader_seed + self.engine.get_data_parallel_rank(),
-                dataloader_kwargs={"shuffle": self.config.shuffle},
-            )
-            with Timer(name="update_policy", logger=None) as timer:
-                for batch_idx, mini_batch in enumerate(dataloader):
-                    mini_batch.meta_info["global_batch_size"] = self.ppo_mini_batch_size
-                    # TODO: make worker API to accept TensorDict as well
-                    mini_batch = mini_batch.to_tensordict()
-                    mini_batch = left_right_2_no_padding(mini_batch)
-                    output = self.engine.train_batch(mini_batch, self.loss_fn)
-                    mini_batch_metrics = output.get("metrics", {})
-                    append_to_dict(metrics, mini_batch_metrics, prefix="actor/")
+        with comm_context("update_actor", reset=True):
+            with self.engine.train_mode():
+                dataloader = data.make_iterator(
+                    mini_batch_size=self.ppo_mini_batch_size_per_dp,
+                    epochs=self.config.ppo_epochs,
+                    seed=self.config.data_loader_seed + self.engine.get_data_parallel_rank(),
+                    dataloader_kwargs={"shuffle": self.config.shuffle},
+                )
+                with Timer(name="update_policy", logger=None) as timer:
+                    for batch_idx, mini_batch in enumerate(dataloader):
+                        mini_batch.meta_info["global_batch_size"] = self.ppo_mini_batch_size
+                        # TODO: make worker API to accept TensorDict as well
+                        mini_batch = mini_batch.to_tensordict()
+                        mini_batch = left_right_2_no_padding(mini_batch)
+                        output = self.engine.train_batch(mini_batch, self.loss_fn)
+                        mini_batch_metrics = output.get("metrics", {})
+                        append_to_dict(metrics, mini_batch_metrics, prefix="actor/")
 
-            delta_time = timer.last
+                delta_time = timer.last
 
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/actor"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+                metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+                metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.engine.lr_scheduler_step()
-            metrics["actor/lr"] = lr
+                lr = self.engine.lr_scheduler_step()
+                metrics["actor/lr"] = lr
 
-            output = DataProto(batch=None, meta_info={"metrics": metrics})
+        comm_stats = get_comm_timing_stats()
+        metrics["comm_s/update_actor"] = comm_stats.get("update_actor", 0.0)
+        metrics.update(gather_timing_stats(delta_time, "timing_dist_s/update_actor"))
+
+        output = DataProto(batch=None, meta_info={"metrics": metrics})
 
         return output
 
@@ -217,6 +242,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         )
 
         initialize_global_process_group_ray(timeout_second=None)
+        enable_comm_timing()
 
         self.loss_fn = partial(value_loss, config=self.config)
 
@@ -290,17 +316,27 @@ class CriticWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="blue", role="critic_compute_values")
     def compute_values(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "values")
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         if self.config.use_dynamic_bsz:
             data.meta_info["max_token_len_per_gpu"] = self.config.ppo_infer_max_token_len_per_gpu
         else:
             data.meta_info["micro_batch_size_per_gpu"] = self.config.ppo_infer_micro_batch_size_per_gpu
 
-        with self.engine.eval_mode():
-            # TODO: make worker API to accept TensorDict as well
-            data = data.to_tensordict()
-            data = left_right_2_no_padding(data)
-            output = self.engine.infer_batch(data)
+        with comm_context(op_name, reset=True):
+            with self.engine.eval_mode():
+                # TODO: make worker API to accept TensorDict as well
+                data = data.to_tensordict()
+                data = left_right_2_no_padding(data)
+                with Timer(name="compute_values", logger=None) as timer:
+                    output = self.engine.infer_batch(data)
+        delta_time = timer.last
+
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
 
         if self.engine.is_mp_src_rank_with_outputs():
             # in megatron, only last pp contains valid data and returned to the single controller
@@ -311,6 +347,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             output = DataProto.from_dict(
                 tensors={"values": values.float()},
             )
+            output.meta_info["timing"] = timing_info
             output = output.to("cpu")
 
         return output
@@ -328,36 +365,41 @@ class CriticWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
         # perform forward computation
-        with self.engine.train_mode():
-            dataloader = data.make_iterator(
-                mini_batch_size=self.ppo_mini_batch_size_per_dp,
-                epochs=self.config.ppo_epochs,
-                seed=self.config.data_loader_seed + self.engine.get_data_parallel_rank(),
-                dataloader_kwargs={"shuffle": self.config.shuffle},
-            )
-            with Timer(name="update_policy", logger=None) as timer:
-                for batch_idx, mini_batch in enumerate(dataloader):
-                    mini_batch.meta_info["global_batch_size"] = self.ppo_mini_batch_size
-                    # TODO: make worker API to accept TensorDict as well
-                    mini_batch = mini_batch.to_tensordict()
-                    mini_batch = left_right_2_no_padding(mini_batch)
-                    output = self.engine.train_batch(mini_batch, self.loss_fn)
-                    mini_batch_metrics = output.get("metrics", {})
-                    append_to_dict(metrics, mini_batch_metrics, prefix="critic/")
+        with comm_context("update_critic", reset=True):
+            with self.engine.train_mode():
+                dataloader = data.make_iterator(
+                    mini_batch_size=self.ppo_mini_batch_size_per_dp,
+                    epochs=self.config.ppo_epochs,
+                    seed=self.config.data_loader_seed + self.engine.get_data_parallel_rank(),
+                    dataloader_kwargs={"shuffle": self.config.shuffle},
+                )
+                with Timer(name="update_policy", logger=None) as timer:
+                    for batch_idx, mini_batch in enumerate(dataloader):
+                        mini_batch.meta_info["global_batch_size"] = self.ppo_mini_batch_size
+                        # TODO: make worker API to accept TensorDict as well
+                        mini_batch = mini_batch.to_tensordict()
+                        mini_batch = left_right_2_no_padding(mini_batch)
+                        output = self.engine.train_batch(mini_batch, self.loss_fn)
+                        mini_batch_metrics = output.get("metrics", {})
+                        append_to_dict(metrics, mini_batch_metrics, prefix="critic/")
 
-            delta_time = timer.last
+                delta_time = timer.last
 
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+                global_num_tokens = data.meta_info["global_token_num"]
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+                metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+                metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.engine.lr_scheduler_step()
-            metrics["critic/lr"] = lr
+                lr = self.engine.lr_scheduler_step()
+                metrics["critic/lr"] = lr
 
-            output = DataProto(batch=None, meta_info={"metrics": metrics})
+        comm_stats = get_comm_timing_stats()
+        metrics["comm_s/update_critic"] = comm_stats.get("update_critic", 0.0)
+        metrics.update(gather_timing_stats(delta_time, "timing_dist_s/update_critic"))
+
+        output = DataProto(batch=None, meta_info={"metrics": metrics})
 
         return output
 
@@ -457,6 +499,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         data.meta_info["calculate_entropy"] = False
+        data.meta_info["timing_op"] = "Role.RefPolicy"
         output = self.ref.compute_log_prob(data)
         if output is not None:
             output.batch["ref_log_prob"] = output.batch.pop("old_log_probs")

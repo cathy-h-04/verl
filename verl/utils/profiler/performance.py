@@ -238,3 +238,39 @@ def topk_reduce_ratio_min_max(timing: float, k: int = 10) -> tuple[float, float,
     top_k_percentile = torch.quantile(tensor_stack, 1 - k / 100)
     tail_ratio = torch.mean((tensor_stack > top_k_percentile).float()).cpu().item()
     return tail_ratio, timing_min, timing_max
+
+
+def gather_timing_stats(
+    timing: float, prefix: str, group: Optional[torch.distributed.ProcessGroup] = None
+) -> dict[str, float]:
+    """Gather timing values across ranks and compute distribution stats.
+
+    Returns metrics with keys:
+      - {prefix}/min
+      - {prefix}/median
+      - {prefix}/p95
+      - {prefix}/max
+      - {prefix}/imbalance (max / median)
+    """
+    if not dist.is_initialized():
+        return {}
+
+    world_size = dist.get_world_size(group=group)
+    timing_tensor = torch.tensor([timing], dtype=torch.float32, device=get_device_id())
+    tensor_list = [torch.zeros_like(timing_tensor) for _ in range(world_size)]
+    dist.all_gather(tensor_list, timing_tensor, group=group)
+    tensor_stack = torch.cat(tensor_list).float()
+
+    timing_min = tensor_stack.min().item()
+    timing_max = tensor_stack.max().item()
+    timing_p50 = torch.quantile(tensor_stack, 0.5).item()
+    timing_p95 = torch.quantile(tensor_stack, 0.95).item()
+    imbalance = timing_max / (timing_p50 + 1e-6)
+
+    return {
+        f"{prefix}/min": timing_min,
+        f"{prefix}/median": timing_p50,
+        f"{prefix}/p95": timing_p95,
+        f"{prefix}/max": timing_max,
+        f"{prefix}/imbalance": imbalance,
+    }

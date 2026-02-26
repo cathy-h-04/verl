@@ -1092,6 +1092,9 @@ class RayPPOTrainer:
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                rollout_timing = {}
+                rl_policy_timing = {}
+                training_timing = {}
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1118,35 +1121,50 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     reward_extra_infos_dict = {}
+                    def _merge_timing_from_output(output, timing_target: dict | None = None):
+                        if output is None:
+                            return
+                        timing = output.meta_info.pop("timing", None)
+                        if timing:
+                            metrics.update(timing)
+                            if timing_target is not None:
+                                timing_target.update(timing)
                     # ===== Phase 1: rollout =====
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_start("rollout", iteration=self.global_steps)
                     # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
+                    with marked_timer("gen", rollout_timing, color="red"):
+                        gen_batch_output.meta_info["timing_op"] = "gen"
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        gen_timing = gen_batch_output.meta_info.pop("timing", None)
+                        if gen_timing:
+                            timing_raw.update(gen_timing)
+                            rollout_timing.update(gen_timing)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
-                        with marked_timer("gen_max", timing_raw, color="purple"):
+                        with marked_timer("gen_max", rollout_timing, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
+                            gen_baseline_batch.meta_info["timing_op"] = "gen_max"
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            _merge_timing_from_output(gen_baseline_output, timing_target=rollout_timing)
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                batch.meta_info["timing_op"] = "reward"
                                 rm_scores = self.rm_wg.compute_rm_score(batch)
+                                _merge_timing_from_output(rm_scores, timing_target=rollout_timing)
                                 batch = batch.union(rm_scores)
                             reward_baseline_tensor, _ = compute_reward(batch, self.reward_fn)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
@@ -1178,16 +1196,19 @@ class RayPPOTrainer:
                     # End Phase 1: rollout
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_end("rollout")
-                        self.phase_profiler.log_timings(timing_raw, "rollout", self.global_steps)
+                        self.phase_profiler.log_timings(rollout_timing, "rollout", self.global_steps)
+                    timing_raw.update(rollout_timing)
 
                     # ===== Phase 2: rl_policy =====
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_start("rl_policy", iteration=self.global_steps)
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
+                    with marked_timer("reward", rl_policy_timing, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            batch.meta_info["timing_op"] = "reward"
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            _merge_timing_from_output(reward_tensor)
                             batch = batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1212,8 +1233,10 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        with marked_timer("old_log_prob", rl_policy_timing, color="blue"):
+                            batch.meta_info["timing_op"] = "old_log_prob"
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            _merge_timing_from_output(old_log_prob)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1234,20 +1257,25 @@ class RayPPOTrainer:
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                        with marked_timer(str(Role.RefPolicy), rl_policy_timing, color="olive"):
                             if not self.ref_in_actor:
+                                batch.meta_info["timing_op"] = "Role.RefPolicy"
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
+                                batch.meta_info["timing_op"] = "Role.RefPolicy"
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            _merge_timing_from_output(ref_log_prob)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
+                        with marked_timer("values", rl_policy_timing, color="cyan"):
+                            batch.meta_info["timing_op"] = "values"
                             values = self.critic_wg.compute_values(batch)
+                            _merge_timing_from_output(values)
                             batch = batch.union(values)
 
-                    with marked_timer("adv", timing_raw, color="brown"):
+                    with marked_timer("adv", rl_policy_timing, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1299,7 +1327,8 @@ class RayPPOTrainer:
                     # End Phase 2: rl_policy
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_end("rl_policy")
-                        self.phase_profiler.log_timings(timing_raw, "rl_policy", self.global_steps)
+                        self.phase_profiler.log_timings(rl_policy_timing, "rl_policy", self.global_steps)
+                    timing_raw.update(rl_policy_timing)
 
                     # ===== Phase 3: training =====
                     if self.phase_profiler:
@@ -1308,7 +1337,7 @@ class RayPPOTrainer:
 
                     # update critic
                     if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
+                        with marked_timer("update_critic", training_timing, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
@@ -1316,7 +1345,7 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
+                        with marked_timer("update_actor", training_timing, color="red"):
                             rollout_config = self.config.actor_rollout_ref.rollout
                             batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
                             # TODO: Make "temperature" single source of truth from generation.
@@ -1333,7 +1362,8 @@ class RayPPOTrainer:
                     # End Phase 3: training
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_end("training")
-                        self.phase_profiler.log_timings(timing_raw, "training", self.global_steps)
+                        self.phase_profiler.log_timings(training_timing, "training", self.global_steps)
+                    timing_raw.update(training_timing)
 
 
                 # validate
@@ -1402,10 +1432,21 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                comm_from_timing = {}
+                for key in list(timing_raw.keys()):
+                    if key.startswith("comm_s/"):
+                        comm_from_timing[key] = timing_raw.pop(key)
+                if comm_from_timing:
+                    metrics.update(comm_from_timing)
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                comm_step = 0.0
+                for op_name in ("gen", "update_actor", "update_critic"):
+                    comm_step += metrics.get(f"comm_s/{op_name}", 0.0)
+                metrics["comm_s/step"] = comm_step
+                metrics["comm_fraction/step"] = comm_step / max(timing_raw.get("step", 0.0), 1e-8)
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one

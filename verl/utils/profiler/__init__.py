@@ -14,6 +14,7 @@
 
 from ..device import is_npu_available
 from ..import_utils import is_nvtx_available
+from .comm import comm_context, enable_comm_timing, get_comm_timing_stats
 from .performance import GPUMemoryLogger, log_gpu_memory_usage, simple_timer
 from .profile import DistProfiler, DistProfilerExtension, ProfilerConfig
 
@@ -29,6 +30,9 @@ else:
 __all__ = [
     "GPUMemoryLogger",
     "log_gpu_memory_usage",
+    "enable_comm_timing",
+    "comm_context",
+    "get_comm_timing_stats",
     "mark_start_range",
     "mark_end_range",
     "mark_annotate",

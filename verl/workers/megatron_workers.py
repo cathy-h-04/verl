@@ -66,10 +66,13 @@ from verl.utils.profiler import (
     DistProfilerExtension,
     GPUMemoryLogger,
     ProfilerConfig,
+    comm_context,
+    enable_comm_timing,
+    get_comm_timing_stats,
     log_gpu_memory_usage,
     simple_timer,
 )
-from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
+from verl.utils.profiler.performance import gather_timing_stats, reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.actor.megatron_actor import MegatronPPOActor
 from verl.workers.config import HFModelConfig, McoreCriticConfig, RolloutConfig
@@ -261,6 +264,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
             get_torch_device().set_device(rank)
+            enable_comm_timing()
+        else:
+            enable_comm_timing()
 
             if self._is_actor or self._is_ref:
                 mpu.initialize_model_parallel(
@@ -716,22 +722,27 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
-        micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
-        dataloader = self.actor.make_minibatch_iterator(data=data)
-        with Timer(name="update_policy", logger=None) as timer:
-            metrics = self.actor.update_policy(dataloader=dataloader)
-        delta_time = timer.last
-        global_num_tokens = data.meta_info["global_token_num"]
-        estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-        metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-        metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-        metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-        metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-        from verl.utils.megatron.optimizer import get_megatron_last_lr
+        with comm_context("update_actor", reset=True):
+            micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
+            data.meta_info["micro_batch_size"] = micro_batch_size
+            dataloader = self.actor.make_minibatch_iterator(data=data)
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(dataloader=dataloader)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            from verl.utils.megatron.optimizer import get_megatron_last_lr
 
-        metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
-        self.actor_optimizer_scheduler.step(1)
+            metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
+            self.actor_optimizer_scheduler.step(1)
+
+        comm_stats = get_comm_timing_stats()
+        metrics["comm_s/update_actor"] = comm_stats.get("update_actor", 0.0)
+        metrics.update(gather_timing_stats(delta_time, "timing_dist_s/update_actor"))
 
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
@@ -771,8 +782,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
-        with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+        op_name = prompts.meta_info.get("timing_op", "gen")
+        with comm_context(op_name, reset=True):
+            with simple_timer("generate_sequences", timing_generate):
+                output = self.rollout.generate_sequences(prompts=prompts)
+
+        comm_stats = get_comm_timing_stats()
+        timing_generate[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -780,17 +796,27 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
+        if op_name == "gen":
+            timing_dist = gather_timing_stats(timing_generate["generate_sequences"], "generation_timing")
+        else:
+            timing_dist = gather_timing_stats(timing_generate["generate_sequences"], f"timing_dist_s/{op_name}")
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
             timing_generate["generate_sequences"]
         )
         timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
-            }
-        )
+        if op_name != "gen":
+            timing_generate.pop("generate_sequences", None)
+        if op_name == "gen":
+            timing_generate.update(
+                {
+                    "generation_timing/max": timing_generate_max,
+                    "generation_timing/min": timing_generate_min,
+                    "generation_timing/topk_ratio": timing_generate_topk_ratio,
+                    **timing_dist,
+                }
+            )
+        else:
+            timing_generate.update(timing_dist)
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")
         # clear kv cache
@@ -801,6 +827,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "Role.RefPolicy")
         assert self._is_ref
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
@@ -810,8 +837,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        with comm_context(op_name, reset=True):
+            with Timer(name="compute_ref_log_prob", logger=None) as timer:
+                output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        delta_time = timer.last
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
         if self._ref_is_offload_param:
             offload_megatron_model_to_cpu(self.ref_module)
@@ -823,6 +859,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="compute_log_prob", logger=logger)
     @DistProfiler.annotate(color="blue")
     def compute_log_prob(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "old_log_prob")
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
@@ -832,11 +869,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        with comm_context(op_name, reset=True):
+            with Timer(name="compute_log_prob", logger=None) as timer:
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        delta_time = timer.last
         output = DataProto.from_dict(
             tensors={"old_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
         )
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
         # clear kv cache
         if self._is_offload_param:
@@ -986,6 +1032,8 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
                 expert_tensor_parallel_size=self.config.megatron.expert_tensor_parallel_size,
                 nccl_communicator_config_path=None,
             )
+        else:
+            enable_comm_timing()
 
         is_collect = (
             mpu.get_tensor_model_parallel_rank() == 0
@@ -1167,6 +1215,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="cyan")
     def compute_values(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "values")
         micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
@@ -1174,8 +1223,17 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         data = data.to(get_device_id())
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.critic_module)
-        values = self.critic.compute_values(data=data)
+        with comm_context(op_name, reset=True):
+            with Timer(name="compute_values", logger=None) as timer:
+                values = self.critic.compute_values(data=data)
+        delta_time = timer.last
         output = DataProto.from_dict(tensors={"values": values})
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.critic_module)
@@ -1191,17 +1249,22 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.critic_optimizer)
 
-        dataloader = self.critic.make_minibatch_iterator(data)
-        with Timer(name="update_critic", logger=None) as timer:
-            metrics = self.critic.update_critic(dataloader=dataloader)
-        delta_time = timer.last
-        global_num_tokens = data.meta_info["global_token_num"]
-        estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-        metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
-        from verl.utils.megatron.optimizer import get_megatron_last_lr
+        with comm_context("update_critic", reset=True):
+            dataloader = self.critic.make_minibatch_iterator(data)
+            with Timer(name="update_critic", logger=None) as timer:
+                metrics = self.critic.update_critic(dataloader=dataloader)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/critic"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+            from verl.utils.megatron.optimizer import get_megatron_last_lr
 
-        metrics["critic/lr"] = get_megatron_last_lr(self.critic_optimizer)
-        self.critic_optimizer_scheduler.step(1)
+            metrics["critic/lr"] = get_megatron_last_lr(self.critic_optimizer)
+            self.critic_optimizer_scheduler.step(1)
+
+        comm_stats = get_comm_timing_stats()
+        metrics["comm_s/update_critic"] = comm_stats.get("update_critic", 0.0)
+        metrics.update(gather_timing_stats(delta_time, "timing_dist_s/update_critic"))
 
         output = DataProto(batch=None, meta_info={"metrics": metrics})
 
@@ -1408,10 +1471,20 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
     def compute_rm_score(self, data: DataProto):
+        op_name = data.meta_info.get("timing_op", "reward")
         data.meta_info["micro_batch_size"] = self.config.micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         data = data.to(get_device_id())
-        output = self.rm.compute_reward(data)
+        with comm_context(op_name, reset=True):
+            with Timer(name="compute_rm_score", logger=None) as timer:
+                output = self.rm.compute_reward(data)
+        delta_time = timer.last
+        timing_info = {}
+        comm_stats = get_comm_timing_stats()
+        timing_info[f"comm_s/{op_name}"] = comm_stats.get(op_name, 0.0)
+        timing_info.update(gather_timing_stats(delta_time, f"timing_dist_s/{op_name}"))
+        timing_info = reduce_timing(timing_info)
+        output.meta_info["timing"] = timing_info
         output = output.to("cpu")
         return output
