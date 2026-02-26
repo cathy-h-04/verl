@@ -1,21 +1,131 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PARAM_FILE="${PARAM_FILE:-/n/home08/chou/verl_research/profiling_scripts/sweep_params.txt}"
-if [ ! -f "$PARAM_FILE" ]; then
-  echo "ERROR: PARAM_FILE not found: $PARAM_FILE"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SLURM_SCRIPT="${SLURM_SCRIPT:-}"
+CHECK_ONLY=0
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      shift
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+
+if [ "${#POSITIONAL[@]}" -lt 1 ]; then
+  echo "ERROR: experiment directory required (contains runs.json and slurm.json)"
+  exit 1
+fi
+EXP_DIR="${POSITIONAL[0]}"
+if [ ! -d "$EXP_DIR" ]; then
+  echo "ERROR: experiment directory not found: $EXP_DIR"
   exit 1
 fi
 
-NUM_LINES=$(tail -n +2 "$PARAM_FILE" | awk 'NF{c++} END{print c+0}')
+EXP_DIR="$(cd "$EXP_DIR" && pwd)"
+RUNS_FILE="${EXP_DIR}/runs.json"
+SLURM_CONFIG_PATH="${EXP_DIR}/slurm.json"
+
+if [ ! -f "$RUNS_FILE" ]; then
+  echo "ERROR: Runs file not found: $RUNS_FILE"
+  exit 1
+fi
+if [[ "$RUNS_FILE" != *.json ]]; then
+  echo "ERROR: Runs file must be JSON: $RUNS_FILE"
+  exit 1
+fi
+
+SLURM_SCRIPT="${SLURM_SCRIPT:-${SCRIPT_DIR}/ray_on_slurm.slurm}"
+
+if [ ! -f "$SLURM_SCRIPT" ]; then
+  echo "ERROR: SLURM_SCRIPT not found: $SLURM_SCRIPT"
+  exit 1
+fi
+
+if [ ! -f "$SLURM_CONFIG_PATH" ]; then
+  echo "ERROR: slurm.json not found: $SLURM_CONFIG_PATH"
+  exit 1
+fi
+
+NUM_LINES=$(python3 "${SCRIPT_DIR}/config_utils.py" count --config "$RUNS_FILE")
+
 if [ "$NUM_LINES" -lt 1 ]; then
-  echo "ERROR: No data rows found in $PARAM_FILE"
+  echo "ERROR: No runs found in $RUNS_FILE"
   exit 1
 fi
 
-MAIL_ARGS=(--mail-user="cathyhou@college.harvard.edu" --mail-type=FAIL,TIME_LIMIT,END)
+SBATCH_ARGS=()
+MAIL_ARGS=()
+if [ -n "${SLURM_CONFIG_PATH:-}" ] && [ -f "${SLURM_CONFIG_PATH:-}" ]; then
+  readarray -t SBATCH_ARGS < <(python3 "${SCRIPT_DIR}/slurm_config_utils.py" sbatch-args --config "$SLURM_CONFIG_PATH")
+  readarray -t MAIL_ARGS < <(python3 "${SCRIPT_DIR}/slurm_config_utils.py" mail-args --config "$SLURM_CONFIG_PATH")
+fi
 
-sbatch "${MAIL_ARGS[@]}" \
+if [ "${#MAIL_ARGS[@]}" -eq 0 ]; then
+  MAIL_ARGS=(--mail-user="cathyhou@college.harvard.edu" --mail-type=FAIL,TIME_LIMIT,END,ARRAY_TASKS)
+fi
+
+EXPORT_VARS="ALL,RUNS_FILE=$RUNS_FILE,SUBMIT_SCRIPT_DIR=$SCRIPT_DIR"
+if [ -n "${SLURM_CONFIG_PATH:-}" ]; then
+  EXPORT_VARS="${EXPORT_VARS},SLURM_CONFIG_PATH=${SLURM_CONFIG_PATH}"
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  echo "CHECK: running local preflight for $NUM_LINES run(s) with $SLURM_SCRIPT"
+  REQUESTED_GPUS_PER_NODE=""
+  for ((i=0; i<${#SBATCH_ARGS[@]}; i++)); do
+    arg="${SBATCH_ARGS[$i]}"
+    case "$arg" in
+      --gpus-per-node=*)
+        REQUESTED_GPUS_PER_NODE="${arg#*=}"
+        ;;
+      --gpus=*)
+        REQUESTED_GPUS_PER_NODE="${arg#*=}"
+        ;;
+      --gres=*)
+        gres="${arg#*=}"
+        if [[ "$gres" == gpu:* ]]; then
+          REQUESTED_GPUS_PER_NODE="${gres#gpu:}"
+        fi
+        ;;
+      --gres)
+        next="${SBATCH_ARGS[$((i+1))]:-}"
+        if [[ "$next" == gpu:* ]]; then
+          REQUESTED_GPUS_PER_NODE="${next#gpu:}"
+        fi
+        ;;
+    esac
+  done
+  if [ -z "$REQUESTED_GPUS_PER_NODE" ]; then
+    REQUESTED_GPUS_PER_NODE=1
+  fi
+  echo "CHECK: using REQUESTED_GPUS_PER_NODE=$REQUESTED_GPUS_PER_NODE"
+
+  for idx in $(seq 1 "$NUM_LINES"); do
+    echo "CHECK: preflight run $idx/$NUM_LINES"
+    SUBMIT_SCRIPT_DIR="$SCRIPT_DIR" \
+      RUNS_FILE="$RUNS_FILE" \
+      SLURM_ARRAY_TASK_ID="$idx" \
+      SLURM_GPUS_PER_NODE="$REQUESTED_GPUS_PER_NODE" \
+      PREFLIGHT_ONLY=1 \
+      bash "$SLURM_SCRIPT"
+  done
+  echo "CHECK: OK"
+  exit 0
+fi
+
+sbatch_output=$(sbatch "${SBATCH_ARGS[@]}" "${MAIL_ARGS[@]}" \
+  --parsable \
   --array=1-"$NUM_LINES" \
-  --export=ALL,PARAM_FILE="$PARAM_FILE" \
-  /n/home08/chou/verl_research/profiling_scripts/ray_on_slurm.slurm
+  --export="$EXPORT_VARS" \
+  "$SLURM_SCRIPT")
+job_id="${sbatch_output%%;*}"
+echo "Submitted batch job ${job_id}"

@@ -7,11 +7,21 @@
 set -euo pipefail
 
 # Ensure SCRATCH_DIR is set for the cluster
-export SCRATCH_DIR="${SCRATCH_DIR:-/n/netscratch/yu_lab/Lab/chou}"
+export SCRATCH_DIR="${SCRATCH_DIR:-${SCRATCH:-/n/netscratch}/yu_lab/Lab/chou}"
 mkdir -p "$SCRATCH_DIR/logs" "$SCRATCH_DIR/checkpoints" "$SCRATCH_DIR/data"
 if [ -n "${RAY_ADDRESS:-}" ]; then
     export RAY_ADDRESS
 fi
+# Prefer node-local scratch for temp/cache to avoid NFS stale file handles.
+LOCAL_SCRATCH="${LOCAL_SCRATCH:-${SLURM_TMPDIR:-/tmp/${USER}}}"
+mkdir -p "$LOCAL_SCRATCH"
+export TMPDIR="${TMPDIR:-${LOCAL_SCRATCH}/tmp}"
+mkdir -p "$TMPDIR"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${LOCAL_SCRATCH}/xdg_cache}"
+export VLLM_CACHE_DIR="${VLLM_CACHE_DIR:-${LOCAL_SCRATCH}/vllm_cache}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${LOCAL_SCRATCH}/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${LOCAL_SCRATCH}/triton}"
+mkdir -p "$XDG_CACHE_HOME" "$VLLM_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 # -------------------- CLI Overrides --------------------
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
@@ -51,33 +61,32 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 EXPERIMENT_NAME="${1:-gsm8k_val_profile}"
-MODEL_NAME="${5:-Qwen/Qwen2.5-7B-Instruct}"
 TOTAL_EPOCHS="${2:-1}"
-GPU_ID="${3:-1}"
-GRANULARITY="${4:-phase}"  # 'phase' or 'operation'
-POLICY="${6:-ppo}"  # ppo | remax
-NNODES="${7:-1}"
-N_GPUS_PER_NODE="${8:-4}"
-DATASET_NAME="${9:-gsm8k}"
-VAL_FREQ="${VAL_FREQ:-${10:-20}}"  # validation frequency in training steps
-VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-${11:-}}"
+GRANULARITY="${3:-phase}"  # 'phase' or 'operation'
+MODEL_NAME="${4:-Qwen/Qwen2.5-7B-Instruct}"
+POLICY="${5:-ppo}"  # ppo | remax
+NNODES="${6:-1}"
+N_GPUS_PER_NODE="${7:-4}"
+DATASET_NAME="${8:-gsm8k}"
+VAL_FREQ="${VAL_FREQ:-${9:-20}}"  # validation frequency in training steps
+VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-${10:-}}"
 TOTAL_STEPS="${TOTAL_STEPS:-}"
 SAVE_FREQ="${SAVE_FREQ:-}"
 export EXPERIMENT_NAME
 
 # Rollout tensor parallel size
-TENSOR_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 # Batch size configuration - SMALL for fast profiling
-TRAIN_BATCH_SIZE=128
-PPO_MINI_BATCH_SIZE=4
-MICRO_BATCH_SIZE_PER_GPU=4
-LOG_PROB_MICRO_BATCH_SIZE=4
-GPU_MEMORY_UTIL=0.50
-ROLLOUT_MAX_BATCHED_TOKENS=8192
-ROLLOUT_MAX_MODEL_LEN=2048
-ROLLOUT_MAX_NUM_SEQS=64
-ROLLOUT_N=4
-ENABLE_GRAD_CHECKPOINTING=true
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
+MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-4}"
+LOG_PROB_MICRO_BATCH_SIZE="${LOG_PROB_MICRO_BATCH_SIZE:-4}"
+GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.50}"
+ROLLOUT_MAX_BATCHED_TOKENS="${ROLLOUT_MAX_BATCHED_TOKENS:-8192}"
+ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-2048}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-64}"
+ROLLOUT_N="${ROLLOUT_N:-4}"
+ENABLE_GRAD_CHECKPOINTING="${ENABLE_GRAD_CHECKPOINTING:-true}"
 
 # -------------------- Environment Setup --------------------
 cd "$PROJECT_DIR"
@@ -90,6 +99,15 @@ source verl-env/bin/activate
 
 export PYTHONPATH="${PYTHONPATH:-}:${PROJECT_DIR}/verl"
 export PYTHONUNBUFFERED=1
+# Optional token script for gated model access
+TOKEN_SCRIPT="${SCRIPT_DIR}/token.sh"
+if [ -f "$TOKEN_SCRIPT" ]; then
+    if ! bash "$TOKEN_SCRIPT"; then
+        echo "WARNING: token script failed: $TOKEN_SCRIPT (continuing)"
+    fi
+else
+    echo "WARNING: token script not found: $TOKEN_SCRIPT (continuing)"
+fi
 # Structured file logging (JSONL) goes to $SCRATCH_DIR/monitoring_val/<experiment>.jsonl
 MONITORING_DIR="${MONITORING_DIR:-${SCRATCH_DIR}/monitoring_val/${EXPERIMENT_NAME}}"
 export VERL_FILE_LOGGER_ROOT="$(dirname "$MONITORING_DIR")"
@@ -127,7 +145,6 @@ echo "Experiment: $EXPERIMENT_NAME"
 echo "Model: $MODEL_NAME"
 echo "Epochs: $TOTAL_EPOCHS"
 echo "Batch Size: $TRAIN_BATCH_SIZE"
-echo "GPU: $GPU_ID"
 echo "Profiling Granularity: $GRANULARITY"
 echo "Policy: $POLICY"
 echo "Nodes: $NNODES (gpus per node: $N_GPUS_PER_NODE)"
@@ -196,10 +213,12 @@ if [ -n "${RAY_ADDRESS:-}" ] && [ "${#RAY_INIT_ARGS[@]}" -eq 0 ]; then
     exit 1
 fi
 
+
 python3 -m verl.trainer.main_ppo \
   data.train_files="$TRAIN_FILE" \
   data.val_files="$VAL_FILE" \
   data.train_batch_size=$TRAIN_BATCH_SIZE \
+  data.dataloader_num_workers=4 \
   data.max_prompt_length=512 \
   data.max_response_length=1024 \
   actor_rollout_ref.model.path="$MODEL_NAME" \

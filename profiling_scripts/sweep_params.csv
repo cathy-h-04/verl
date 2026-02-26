@@ -1,7 +1,0 @@
-BASE_EXPERIMENT_NAME,MODEL_NAME,EPOCHS,POLL_INTERVAL,GRANULARITY,POLICY,NNODES,N_GPUS_PER_NODE,DATASET_NAME,USE_VALIDATION
-gsm8k_ppo_7b,Qwen/Qwen2.5-7B-Instruct,1,0.5,phase,ppo,1,4,gsm8k,0
-gsm8k_grpo_7b,Qwen/Qwen2.5-7B-Instruct,1,0.5,phase,grpo,1,4,gsm8k,0
-gsm8k_remax_7b,Qwen/Qwen2.5-7B-Instruct,1,0.5,phase,remax,1,4,gsm8k,0
-gsm8k_ppo_7b_val,Qwen/Qwen2.5-7B-Instruct,1,0.5,phase,ppo,1,4,gsm8k,1
-gsm8k_grpo_7b_val,Qwen/Qwen2.5-7B-Instruct,1,0.5,phase,grpo,1,4,gsm8k,1
-gsm8k_remax_7b_val,Qwen/Qwen2.5-7B-Instruct,1,0.5,phase,remax,1,4,gsm8k,1
