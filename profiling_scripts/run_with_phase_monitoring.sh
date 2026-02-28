@@ -66,6 +66,11 @@ export EXPERIMENT_NAME
 export MONITORING_DIR
 export PROJECT_DIR
 export SCRATCH_DIR
+export NNODES
+export N_GPUS_PER_NODE
+# Telemetry sampling controls for JSONL NVML/RAPL collector.
+# Keep POLL_INTERVAL as the single source of truth.
+export VERL_TELEMETRY_SAMPLE_INTERVAL_S="$POLL_INTERVAL"
 
 # Persist experiment metadata alongside monitoring outputs (scratch + later migrated)
 echo "$EXPERIMENT_NAME" > "${MONITORING_DIR}/experiment_name.txt"
@@ -130,12 +135,6 @@ cleanup() {
         ray stop 2>/dev/null || true
     fi
 
-    if [ -n "${MONITOR_PID:-}" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
-        echo "Stopping monitor (PID: $MONITOR_PID)..."
-        kill "$MONITOR_PID" 2>/dev/null || true
-        wait "$MONITOR_PID" 2>/dev/null || true
-    fi
-
     # Remove phase state file ONLY (CSV + JSONL are data)
     rm -f "${MONITORING_DIR}/phase_state_${EXPERIMENT_NAME}.json"
 
@@ -146,25 +145,6 @@ cleanup() {
 }
 
 trap cleanup EXIT INT TERM
-
-# -------------------- Start GPU Monitor --------------------
-echo "Starting GPU monitor..."
-
-MONITORING_DIR="$MONITORING_DIR" bash "${PROFILING_DIR}/monitor_nvidia_smi_phased.sh" \
-    "$EXPERIMENT_NAME" \
-    "$GPU_ID" \
-    "$POLL_INTERVAL" \
-    "$NNODES" \
-    "$N_GPUS_PER_NODE" &
-
-MONITOR_PID=$!
-echo "Monitor started (PID: $MONITOR_PID)"
-
-sleep 2
-if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
-    echo "ERROR: Monitor failed to start"
-    exit 1
-fi
 
 # -------------------- Start Training --------------------
 echo ""

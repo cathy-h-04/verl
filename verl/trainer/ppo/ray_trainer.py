@@ -27,7 +27,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -380,8 +380,7 @@ class RayPPOTrainer:
         # Initialize phase profiler
         self.phase_profiler = None
         if PHASE_PROFILER_AVAILABLE and self.config.trainer.get("enable_phase_profiling", False):
-            experiment_name = os.environ.get("EXPERIMENT_NAME")
-            assert experiment_name is not None, "EXPERIMENT_NAME must be set by launcher"
+            experiment_name = os.environ.get("EXPERIMENT_NAME") or self.config.trainer.experiment_name
             granularity = self.config.trainer.get("phase_profiling_granularity", "phase")
             self.phase_profiler = PhaseProfiler(
                 experiment_name=experiment_name,
@@ -472,6 +471,32 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _dedup_wide_timing_metrics(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        """Drop phase/subphase timing breakdown metrics from wide logs in operation mode."""
+        if not self.phase_profiler:
+            return metrics
+
+        granularity = str(getattr(self.phase_profiler, "granularity", "")).lower()
+        if granularity != "operation":
+            return metrics
+
+        keep_timing_keys = {"timing_s/step", "timing_s/gen"}
+        filtered: dict[str, Any] = {}
+        for key, value in metrics.items():
+            drop = False
+            if key == "perf/time_per_step":
+                drop = True
+            elif key.startswith("generation_timing/"):
+                drop = True
+            elif key.startswith("timing_dist_s/"):
+                drop = True
+            elif key.startswith("timing_s/") and key not in keep_timing_keys:
+                drop = True
+
+            if not drop:
+                filtered[key] = value
+        return filtered
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1193,6 +1218,31 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    if self.phase_profiler and hasattr(self.phase_profiler, "log_tokens_and_steps"):
+                        try:
+                            max_response_len = batch.batch["responses"].shape[-1]
+                            response_mask = batch.batch["response_mask"]
+                            attention_mask = batch.batch["attention_mask"]
+                            output_tokens_total = int(response_mask.sum().item())
+                            prompt_tokens_total = int(attention_mask[:, :-max_response_len].sum().item())
+                            rollout_total_tokens = prompt_tokens_total + output_tokens_total
+                            output_len_per_seq = response_mask.sum(dim=-1).float()
+                            rollout_payload = {
+                                "rollout_num_sequences": int(batch.batch["responses"].shape[0]),
+                                "rollout_prompt_tokens_total": prompt_tokens_total,
+                                "rollout_output_tokens_total": output_tokens_total,
+                                "rollout_total_tokens": rollout_total_tokens,
+                                "rollout_max_seq_len": int(output_len_per_seq.max().item()),
+                                "rollout_mean_output_len": float(output_len_per_seq.mean().item()),
+                            }
+                            self.phase_profiler.log_tokens_and_steps(
+                                payload=rollout_payload,
+                                phase_name="rollout",
+                                iteration=self.global_steps,
+                            )
+                        except Exception as e:
+                            print(f"Warning: rollout token denominator logging failed: {e}")
+
                     # End Phase 1: rollout
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_end("rollout")
@@ -1359,6 +1409,45 @@ class RayPPOTrainer:
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
+                    if self.phase_profiler and hasattr(self.phase_profiler, "log_tokens_and_steps"):
+                        try:
+                            actor_cfg = self.config.actor_rollout_ref.actor
+                            train_batch_tokens = int(sum(batch.meta_info.get("global_token_num", [])))
+                            batch_size = int(batch.batch["attention_mask"].shape[0])
+                            avg_tokens_per_sequence = train_batch_tokens / max(batch_size, 1)
+
+                            microbatch_size = actor_cfg.get("ppo_micro_batch_size_per_gpu")
+                            train_microbatch_tokens_estimated = (
+                                int(avg_tokens_per_sequence * microbatch_size) if microbatch_size else None
+                            )
+
+                            mini_batch_size = actor_cfg.get("ppo_mini_batch_size")
+                            train_minibatch_count_estimated = (
+                                int(np.ceil(batch_size / mini_batch_size)) if mini_batch_size else None
+                            )
+
+                            train_epochs = int(actor_cfg.get("ppo_epochs", 1))
+                            train_minibatch_passes_estimated = 1
+                            train_tokens_effective_estimated = (
+                                train_batch_tokens * train_epochs * train_minibatch_passes_estimated
+                            )
+
+                            training_payload = {
+                                "train_batch_tokens": train_batch_tokens,
+                                "train_microbatch_tokens_estimated": train_microbatch_tokens_estimated,
+                                "train_epochs": train_epochs,
+                                "train_minibatch_count_estimated": train_minibatch_count_estimated,
+                                "train_minibatch_passes_estimated": train_minibatch_passes_estimated,
+                                "train_tokens_effective_estimated": train_tokens_effective_estimated,
+                            }
+                            self.phase_profiler.log_tokens_and_steps(
+                                payload=training_payload,
+                                phase_name="training",
+                                iteration=self.global_steps,
+                            )
+                        except Exception as e:
+                            print(f"Warning: training token denominator logging failed: {e}")
+
                     # End Phase 3: training
                     if self.phase_profiler:
                         self.phase_profiler.mark_phase_end("training")
@@ -1367,6 +1456,7 @@ class RayPPOTrainer:
 
 
                 # validate
+                validation_logged = False
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
@@ -1385,6 +1475,7 @@ class RayPPOTrainer:
                         # Avoid labeling non-validation work as validation.
                         self.phase_profiler.mark_phase_start("other", iteration=self.global_steps)
                     metrics.update(val_metrics)
+                    validation_logged = True
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
@@ -1455,9 +1546,11 @@ class RayPPOTrainer:
 
                 # Add logging metadata for downstream alignment/analysis.
                 metrics["logging/wall_time"] = time.time()
+                metrics["logging/record_scope"] = "iteration_summary"
+                metrics["logging/validation_logged"] = validation_logged
                 if self.phase_profiler:
-                    metrics["logging/phase"] = getattr(self.phase_profiler, "current_phase", None)
                     metrics["logging/granularity"] = getattr(self.phase_profiler, "granularity", None)
+                metrics = self._dedup_wide_timing_metrics(metrics)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

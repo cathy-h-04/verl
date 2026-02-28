@@ -84,12 +84,30 @@ Resolved configs are written alongside monitoring outputs:
 
 ## Internal scripts (called automatically)
 - `run_with_phase_monitoring.sh`
-  - Orchestrator: starts GPU monitor, runs training, handles cleanup.
+  - Orchestrator: runs training + phase telemetry, handles cleanup.
 - `run_verl_train_nonval.sh`
   - Training without validation (fast profiling).
 - `run_verl_train_val.sh`
   - Training with validation.
 - `monitor_nvidia_smi_phased.sh`
-  - GPU monitoring + phase annotations.
+  - Legacy GPU monitoring + phase annotations (not used by default launcher path).
 - `verl_subphase_profiler.py`
   - Phase IPC + optional sub-phase timing logs.
+  - Also emits NVML/RAPL boundary + periodic JSONL telemetry in the monitoring directory:
+    - `nvml_boundary.jsonl`, `nvml_periodic.jsonl`
+    - `rapl_boundary.jsonl`, `rapl_periodic.jsonl`
+    - `tokens_and_steps.jsonl`
+  - Sampling cadence knobs:
+    - `VERL_TELEMETRY_SAMPLE_INTERVAL_S` (seconds)
+    - `VERL_TELEMETRY_SAMPLE_HZ` (frequency; overrides interval if set)
+  - In `granularity=operation`, `phase_timings_<experiment>.jsonl` emits one record per subphase metric with explicit tags:
+    - `phase_name`, `subphase_name`, `value`, `metric_unit`
+  - Wide trainer JSONL (`<experiment>.jsonl`) deduplicates timing breakdown keys in `operation` mode:
+    - drops `generation_timing/*`, `timing_dist_s/*`, and most `timing_s/*`
+    - keeps `timing_s/step` and `timing_s/gen` as top-level convenience KPIs
+    - drops `perf/time_per_step` (duplicate of `timing_s/step`)
+
+- `postprocess_energy_metrics.py`
+  - Computes phase-level derived metrics (energy deltas, avg power, throttle fraction, correlations, J/token).
+  - Example:
+    - `python3 profiling_scripts/postprocess_energy_metrics.py --monitor-dir /path/to/monitoring/<experiment>`
