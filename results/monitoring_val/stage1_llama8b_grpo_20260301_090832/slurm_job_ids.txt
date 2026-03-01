@@ -1,0 +1,4 @@
+timestamp: 20260301_094256
+slurm_job_id: 63028594
+slurm_array_task_id: 3
+slurm_job_name: llama_new_baseline
