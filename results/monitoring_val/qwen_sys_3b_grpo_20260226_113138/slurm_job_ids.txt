@@ -1,4 +1,0 @@
-timestamp: 20260226_115314
-slurm_job_id: 62242862
-slurm_array_task_id: 3
-slurm_job_name: verl-baseline
