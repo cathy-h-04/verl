@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_rollout_scale/runs.json",
+    "index": 1,
+    "name": "llama8b_ppo_16384"
+  },
+  "run": {
+    "use_validation": true,
+    "val_freq": 10,
+    "resume_path": null,
+    "val_max_samples": 128,
+    "rollout_n": 1,
+    "save_freq": -1,
+    "total_steps": null,
+    "dataset": "gsm8k",
+    "nnodes": 1,
+    "gpus_per_node": 4,
+    "name": "llama8b_ppo_16384",
+    "total_epochs": 1,
+    "poll_interval": 0.5,
+    "granularity": "operation",
+    "policy": "ppo",
+    "model": "meta-llama/Llama-3.1-8B-Instruct"
+  },
+  "train": {
+    "ppo_mini_batch_size": 32,
+    "log_prob_micro_batch_size": 4,
+    "rollout_max_batched_tokens": 16384,
+    "rollout_max_num_seqs": 64,
+    "tensor_parallel_size": 1,
+    "gpu_memory_util": 0.5,
+    "micro_batch_size_per_gpu": 4,
+    "train_batch_size": 128,
+    "enable_grad_checkpointing": true,
+    "rollout_max_model_len": 2048
+  }
+}
