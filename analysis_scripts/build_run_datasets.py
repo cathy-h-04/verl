@@ -11,14 +11,44 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from ingestion_checks import (
+    build_phase_outlier_flags,
+    build_boundary_integrity_outputs,
+    build_step_index_and_checks,
+    validate_ingestion_checks,
+)
+from periodic_aggregations import (
+    add_time_weights,
+    aggregate_periodic_metrics,
+    filter_periodic_to_phase_window,
+)
+from utils import (
+    _build_analysis_views,
+    _build_phase_fact,
+    _canonicalize_step,
+    _classify_metric,
+    _coalesce_join_column,
+    _discover_run_dirs,
+    _ensure_columns,
+    _extract_lineage,
+    _json_default,
+    _parse_slurm_job_ids,
+    _read_json,
+    _read_jsonl,
+    _read_text,
+    _required_files_for_run,
+    _safe_float,
+    _safe_int,
+    _sanitize_col,
+    _stable_hash,
+)
 
 
 REQUIRED_STATIC_FILES = [
@@ -73,6 +103,11 @@ CURATED_METRIC_KEYS = [
 TABLE_FILES = {
     "runs": "runs.parquet",
     "run_lineage": "run_lineage.parquet",
+    "step_index_map": "step_index_map.parquet",
+    "ingestion_checks": "ingestion_checks.parquet",
+    "phase_instances": "phase_instances.parquet",
+    "boundary_pair_integrity": "boundary_pair_integrity.parquet",
+    "phase_fact": "phase_fact.parquet",
     "step_metrics_long": "step_metrics_long.parquet",
     "step_metrics_wide_curated": "step_metrics_wide_curated.parquet",
     "phase_timings_long": "phase_timings_long.parquet",
@@ -81,15 +116,13 @@ TABLE_FILES = {
     "hardware_periodic": "hardware_periodic.parquet",
     "phase_summary": "phase_summary.parquet",
     "ingestion_report": "ingestion_report.parquet",
+    "phase_fact_view": "phase_fact_view.parquet",
+    "step_fact_view": "step_fact_view.parquet",
+    "run_summary_view": "run_summary_view.parquet",
+    "comparison_view": "comparison_view.parquet",
+    "device_timeseries_view": "device_timeseries_view.parquet",
+    "integrity_view": "integrity_view.parquet",
 }
-
-
-@dataclass
-class JsonlReadResult:
-    records: List[Dict[str, Any]]
-    parse_errors: int
-    nonempty_lines: int
-
 
 @dataclass
 class RunQuality:
@@ -128,126 +161,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _sanitize_col(metric_key: str) -> str:
-    name = re.sub(r"[^0-9a-zA-Z]+", "_", metric_key).strip("_").lower()
-    return f"metric_{name}" if name else "metric_unknown"
-
-
-def _safe_int(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
-
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8").strip()
-
-
-def _read_json(path: Path) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-    return obj if isinstance(obj, dict) else {"_value": obj}
-
-
-def _read_jsonl(path: Path) -> JsonlReadResult:
-    records: List[Dict[str, Any]] = []
-    parse_errors = 0
-    nonempty = 0
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            nonempty += 1
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    records.append(obj)
-                else:
-                    records.append({"_value": obj})
-            except Exception:
-                parse_errors += 1
-
-    return JsonlReadResult(records=records, parse_errors=parse_errors, nonempty_lines=nonempty)
-
-
-def _parse_slurm_job_ids(path: Path) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or ":" not in line:
-                continue
-            key, val = line.split(":", 1)
-            out[key.strip()] = val.strip()
-    return out
-
-
-def _discover_run_dirs(results_root: Path) -> List[Path]:
-    run_dirs = sorted({p.parent for p in results_root.rglob("experiment_name.txt")})
-    return [p for p in run_dirs if p.is_dir()]
-
-
-def _required_files_for_run(run_id: str) -> List[str]:
-    return REQUIRED_STATIC_FILES + [
-        f"{run_id}.jsonl",
-        f"{run_id}_config.json",
-        f"phase_timings_{run_id}.jsonl",
-    ]
-
-
-def _extract_lineage(resume_path: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
-    if not resume_path:
-        return None, None
-    m = re.search(r"/checkpoints/(.+?)/global_step_(\d+)$", resume_path)
-    if not m:
-        return None, None
-    parent_run_name, step = m.group(1), m.group(2)
-    return parent_run_name, _safe_int(step)
-
-
-def _json_default(x: Any) -> Any:
-    if isinstance(x, Path):
-        return str(x)
-    return str(x)
-
-
-def _ensure_columns(df: pd.DataFrame, required_cols: Iterable[str]) -> pd.DataFrame:
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = None
-    return df
-
-
-def _classify_metric(value: Any) -> Tuple[str, Optional[float], Optional[bool], Optional[str]]:
-    if value is None:
-        return "null", None, None, None
-    if isinstance(value, bool):
-        return "bool", None, value, None
-    if isinstance(value, (int, float)):
-        return "number", float(value), None, None
-    if isinstance(value, str):
-        return "string", None, None, value
-    try:
-        encoded = json.dumps(value, ensure_ascii=True, default=_json_default)
-    except Exception:
-        encoded = str(value)
-    return "other", None, None, encoded
-
-
 def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> None:
     if overwrite and output_root.exists():
         shutil.rmtree(output_root)
@@ -257,6 +170,10 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
 
     runs_rows: List[Dict[str, Any]] = []
     lineage_rows: List[Dict[str, Any]] = []
+    step_index_rows: List[Dict[str, Any]] = []
+    ingestion_checks_rows: List[Dict[str, Any]] = []
+    phase_instance_rows: List[Dict[str, Any]] = []
+    boundary_pair_rows: List[Dict[str, Any]] = []
     step_metrics_long_rows: List[Dict[str, Any]] = []
     phase_timings_rows: List[Dict[str, Any]] = []
     tokens_rows: List[Dict[str, Any]] = []
@@ -265,6 +182,7 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
     report_rows: List[Dict[str, Any]] = []
 
     wide_rows_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    validation_steps_by_run: Dict[str, set[int]] = defaultdict(set)
     curated_metric_cols = {_k: _sanitize_col(_k) for _k in CURATED_METRIC_KEYS}
 
     for run_dir in run_dirs:
@@ -283,7 +201,7 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
             run_id = _read_text(run_dir / "experiment_name.txt")
             quality.run_id = run_id
 
-            required_files = _required_files_for_run(run_id)
+            required_files = _required_files_for_run(run_id, REQUIRED_STATIC_FILES)
             missing = [f for f in required_files if not (run_dir / f).exists()]
             if missing:
                 quality.reason = "missing_required_files"
@@ -358,50 +276,71 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
             quality.status = "included"
             quality.reason = "ok"
 
-            runs_rows.append(
-                {
-                    "run_id": run_id,
-                    "run_dir": str(run_dir),
-                    "results_root": str(results_root),
-                    "logical_run_group": logical_run_group,
-                    "run_name": run_config.get("run", {}).get("name") if isinstance(run_config.get("run"), dict) else None,
-                    "model": run_config.get("run", {}).get("model") if isinstance(run_config.get("run"), dict) else None,
-                    "dataset": run_config.get("run", {}).get("dataset") if isinstance(run_config.get("run"), dict) else None,
-                    "policy": run_config.get("run", {}).get("policy") if isinstance(run_config.get("run"), dict) else None,
-                    "use_validation": run_config.get("run", {}).get("use_validation")
-                    if isinstance(run_config.get("run"), dict)
-                    else None,
-                    "val_freq": run_config.get("run", {}).get("val_freq") if isinstance(run_config.get("run"), dict) else None,
-                    "poll_interval": run_config.get("run", {}).get("poll_interval")
-                    if isinstance(run_config.get("run"), dict)
-                    else None,
-                    "total_steps": run_config.get("run", {}).get("total_steps")
-                    if isinstance(run_config.get("run"), dict)
-                    else None,
-                    "total_epochs": run_config.get("run", {}).get("total_epochs")
-                    if isinstance(run_config.get("run"), dict)
-                    else None,
-                    "resume_path": resume_path,
-                    "is_resumed_run": bool(resume_path),
-                    "resume_parent_run_name": parent_run_name,
-                    "resume_from_global_step": resume_from_global_step,
-                    "meta_source": run_config.get("meta", {}).get("source") if isinstance(run_config.get("meta"), dict) else None,
-                    "meta_index": run_config.get("meta", {}).get("index") if isinstance(run_config.get("meta"), dict) else None,
-                    "meta_name": run_config.get("meta", {}).get("name") if isinstance(run_config.get("meta"), dict) else None,
-                    "slurm_job_id": slurm_ids.get("slurm_job_id"),
-                    "slurm_array_task_id": slurm_ids.get("slurm_array_task_id"),
-                    "slurm_job_name": slurm_ids.get("slurm_job_name"),
-                    "slurm_timestamp": slurm_ids.get("timestamp"),
-                    "slurm_partition": slurm_config.get("partition"),
-                    "slurm_nodes": slurm_config.get("nodes"),
-                    "slurm_gpus_per_node": slurm_config.get("gpus_per_node"),
-                    "slurm_cpus_per_task": slurm_config.get("cpus_per_task"),
-                    "slurm_mem": slurm_config.get("mem"),
-                    "run_config_json": json.dumps(run_config, ensure_ascii=True, default=_json_default),
-                    "slurm_config_json": json.dumps(slurm_config, ensure_ascii=True, default=_json_default),
-                    "full_config_json": json.dumps(full_config, ensure_ascii=True, default=_json_default),
-                }
+            run_step_observations: List[Dict[str, Any]] = []
+            run_boundary_rows_local: List[Dict[str, Any]] = []
+
+            def register_step_observation(
+                raw_step: Optional[int], raw_iteration: Optional[int], source_table: str
+            ) -> Tuple[Optional[int], bool]:
+                canonical_step, mismatch_flag = _canonicalize_step(raw_step, raw_iteration)
+                run_step_observations.append(
+                    {
+                        "run_id": run_id,
+                        "source_table": source_table,
+                        "raw_step": raw_step,
+                        "raw_iteration": raw_iteration,
+                        "canonical_step": canonical_step,
+                        "mismatch_flag": mismatch_flag,
+                    }
+                )
+                return canonical_step, mismatch_flag
+
+            configured_total_steps = (
+                run_config.get("run", {}).get("total_steps") if isinstance(run_config.get("run"), dict) else None
             )
+            run_row = {
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "results_root": str(results_root),
+                "logical_run_group": logical_run_group,
+                "run_name": run_config.get("run", {}).get("name") if isinstance(run_config.get("run"), dict) else None,
+                "model": run_config.get("run", {}).get("model") if isinstance(run_config.get("run"), dict) else None,
+                "dataset": run_config.get("run", {}).get("dataset") if isinstance(run_config.get("run"), dict) else None,
+                "policy": run_config.get("run", {}).get("policy") if isinstance(run_config.get("run"), dict) else None,
+                "use_validation": run_config.get("run", {}).get("use_validation")
+                if isinstance(run_config.get("run"), dict)
+                else None,
+                "val_freq": run_config.get("run", {}).get("val_freq") if isinstance(run_config.get("run"), dict) else None,
+                "poll_interval": run_config.get("run", {}).get("poll_interval")
+                if isinstance(run_config.get("run"), dict)
+                else None,
+                "total_steps": configured_total_steps,
+                "configured_total_steps": configured_total_steps,
+                "observed_total_steps": None,
+                "total_steps_from_observed_fallback": False,
+                "total_epochs": run_config.get("run", {}).get("total_epochs")
+                if isinstance(run_config.get("run"), dict)
+                else None,
+                "resume_path": resume_path,
+                "is_resumed_run": bool(resume_path),
+                "resume_parent_run_name": parent_run_name,
+                "resume_from_global_step": resume_from_global_step,
+                "meta_source": run_config.get("meta", {}).get("source") if isinstance(run_config.get("meta"), dict) else None,
+                "meta_index": run_config.get("meta", {}).get("index") if isinstance(run_config.get("meta"), dict) else None,
+                "meta_name": run_config.get("meta", {}).get("name") if isinstance(run_config.get("meta"), dict) else None,
+                "slurm_job_id": slurm_ids.get("slurm_job_id"),
+                "slurm_array_task_id": slurm_ids.get("slurm_array_task_id"),
+                "slurm_job_name": slurm_ids.get("slurm_job_name"),
+                "slurm_timestamp": slurm_ids.get("timestamp"),
+                "slurm_partition": slurm_config.get("partition"),
+                "slurm_nodes": slurm_config.get("nodes"),
+                "slurm_gpus_per_node": slurm_config.get("gpus_per_node"),
+                "slurm_cpus_per_task": slurm_config.get("cpus_per_task"),
+                "slurm_mem": slurm_config.get("mem"),
+                "run_config_json": json.dumps(run_config, ensure_ascii=True, default=_json_default),
+                "slurm_config_json": json.dumps(slurm_config, ensure_ascii=True, default=_json_default),
+                "full_config_json": json.dumps(full_config, ensure_ascii=True, default=_json_default),
+            }
 
             lineage_rows.append(
                 {
@@ -419,17 +358,28 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
                 data = rec.get("data")
                 if step is None or not isinstance(data, dict):
                     continue
+                raw_iteration = _safe_int(data.get("training/global_step"))
+                canonical_step, _ = register_step_observation(
+                    raw_step=step,
+                    raw_iteration=raw_iteration,
+                    source_table="step_metrics",
+                )
 
                 validation_logged = data.get("logging/validation_logged")
                 if not isinstance(validation_logged, bool):
                     validation_logged = None
+                if validation_logged is True and canonical_step is not None:
+                    validation_steps_by_run[run_id].add(int(canonical_step))
 
-                wide_key = (run_id, step)
+                wide_key = (run_id, canonical_step if canonical_step is not None else step)
                 if wide_key not in wide_rows_map:
                     wide_rows_map[wide_key] = {
                         "run_id": run_id,
                         "logical_run_group": logical_run_group,
-                        "global_step": step,
+                        "global_step": canonical_step if canonical_step is not None else step,
+                        "global_step_canonical": canonical_step if canonical_step is not None else step,
+                        "global_step_raw_stepfield": step,
+                        "global_step_raw_iterationfield": raw_iteration,
                         "validation_logged": validation_logged,
                     }
                 elif validation_logged is not None:
@@ -441,7 +391,10 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
                         {
                             "run_id": run_id,
                             "logical_run_group": logical_run_group,
-                            "global_step": step,
+                            "global_step": canonical_step if canonical_step is not None else step,
+                            "global_step_canonical": canonical_step if canonical_step is not None else step,
+                            "global_step_raw_stepfield": step,
+                            "global_step_raw_iterationfield": raw_iteration,
                             "metric_key": metric_key,
                             "metric_type": metric_type,
                             "metric_value_float": metric_value_float,
@@ -464,35 +417,61 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
 
             # Phase timings table.
             for rec in read_map["phase_timings"].records:
+                raw_iteration = _safe_int(rec.get("iteration"))
+                canonical_step, _ = register_step_observation(
+                    raw_step=None,
+                    raw_iteration=raw_iteration,
+                    source_table="phase_timings",
+                )
                 row = dict(rec)
                 row["run_id"] = run_id
                 row["logical_run_group"] = logical_run_group
-                row["global_step"] = _safe_int(rec.get("iteration"))
+                row["global_step"] = canonical_step
+                row["global_step_canonical"] = canonical_step
+                row["global_step_raw_stepfield"] = None
+                row["global_step_raw_iterationfield"] = raw_iteration
                 phase_timings_rows.append(row)
 
             # Tokens and steps table.
             for rec in read_map["tokens"].records:
+                raw_iteration = _safe_int(rec.get("iteration"))
+                canonical_step, _ = register_step_observation(
+                    raw_step=None,
+                    raw_iteration=raw_iteration,
+                    source_table="tokens_and_steps",
+                )
                 row = dict(rec)
                 row["run_id"] = run_id
                 row["logical_run_group"] = logical_run_group
-                row["global_step"] = _safe_int(rec.get("iteration"))
+                row["global_step"] = canonical_step
+                row["global_step_canonical"] = canonical_step
+                row["global_step_raw_stepfield"] = None
+                row["global_step_raw_iterationfield"] = raw_iteration
                 tokens_rows.append(row)
 
             # Hardware tables.
             def add_hw_rows(records: List[Dict[str, Any]], source: str, record_kind: str) -> None:
                 target = hw_boundary_rows if record_kind == "boundary" else hw_periodic_rows
                 for rec in records:
-                    global_step = _safe_int(rec.get("iteration"))
+                    raw_iteration = _safe_int(rec.get("iteration"))
+                    canonical_step, _ = register_step_observation(
+                        raw_step=None,
+                        raw_iteration=raw_iteration,
+                        source_table=f"hardware_{record_kind}_{source}",
+                    )
                     phase_name = rec.get("phase_name")
 
                     # Drop warmup idle rows by request.
-                    if record_kind == "periodic" and global_step == 0 and phase_name == "idle":
+                    if record_kind == "periodic" and canonical_step == 0 and phase_name == "idle":
                         continue
 
                     row = dict(rec)
                     row["run_id"] = run_id
                     row["logical_run_group"] = logical_run_group
-                    row["global_step"] = global_step
+                    row["global_step"] = canonical_step
+                    row["global_step_canonical"] = canonical_step
+                    row["global_step_raw_stepfield"] = None
+                    row["global_step_raw_iterationfield"] = raw_iteration
                     row["source"] = source
                     row["record_kind"] = record_kind
 
@@ -503,6 +482,18 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
                         row["device_kind"] = "rapl"
                         row["device_id"] = row.get("rapl_domain") or row.get("domain_path")
 
+                    row["phase_instance_id"] = _stable_hash(
+                        run_id,
+                        canonical_step,
+                        row.get("phase_id"),
+                        row.get("phase_name"),
+                    )
+                    row["boundary_pair_key"] = (
+                        _stable_hash(row["phase_instance_id"], source, row.get("device_id"))
+                        if record_kind == "boundary"
+                        else None
+                    )
+
                     # Convenience converted column while keeping raw units.
                     row["phase_domain_energy_delta_j"] = None
                     if "phase_domain_energy_delta_uJ" in row:
@@ -510,11 +501,40 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
                         row["phase_domain_energy_delta_j"] = (uj / 1_000_000.0) if uj is not None else None
 
                     target.append(row)
+                    if record_kind == "boundary":
+                        run_boundary_rows_local.append(row)
 
             add_hw_rows(read_map["nvml_boundary"].records, "nvml", "boundary")
             add_hw_rows(read_map["rapl_boundary"].records, "rapl", "boundary")
             add_hw_rows(read_map["nvml_periodic"].records, "nvml", "periodic")
             add_hw_rows(read_map["rapl_periodic"].records, "rapl", "periodic")
+
+            phase_rows_local, pair_rows_local, boundary_pair_integrity, boundary_pair_total, boundary_pair_valid = (
+                build_boundary_integrity_outputs(run_id=run_id, run_boundary_rows_local=run_boundary_rows_local)
+            )
+            phase_instance_rows.extend(phase_rows_local)
+            boundary_pair_rows.extend(pair_rows_local)
+
+            step_index_local_rows, run_checks = build_step_index_and_checks(
+                run_id=run_id, run_step_observations=run_step_observations
+            )
+            step_index_rows.extend(step_index_local_rows)
+            run_checks["boundary_pair_integrity"] = boundary_pair_integrity
+            run_checks["boundary_pair_total"] = boundary_pair_total
+            run_checks["boundary_pair_valid"] = boundary_pair_valid
+            ingestion_checks_rows.append(run_checks)
+
+            observed_steps = [
+                _safe_int(obs.get("canonical_step"))
+                for obs in run_step_observations
+                if _safe_int(obs.get("canonical_step")) is not None
+            ]
+            observed_total_steps = max(observed_steps) if observed_steps else None
+            run_row["observed_total_steps"] = observed_total_steps
+            if run_row["total_steps"] is None and observed_total_steps is not None:
+                run_row["total_steps"] = observed_total_steps
+                run_row["total_steps_from_observed_fallback"] = True
+            runs_rows.append(run_row)
 
             report_rows.append(
                 {
@@ -535,18 +555,23 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
     # Build DataFrames.
     runs_df = pd.DataFrame(runs_rows)
     lineage_df = pd.DataFrame(lineage_rows)
+    step_index_map_df = pd.DataFrame(step_index_rows)
+    ingestion_checks_df = pd.DataFrame(ingestion_checks_rows)
+    phase_instances_df = pd.DataFrame(phase_instance_rows)
+    boundary_pair_integrity_df = pd.DataFrame(boundary_pair_rows)
     metrics_long_df = pd.DataFrame(step_metrics_long_rows)
     phase_timings_df = pd.DataFrame(phase_timings_rows)
     tokens_df = pd.DataFrame(tokens_rows)
     hw_boundary_df = pd.DataFrame(hw_boundary_rows)
     hw_periodic_df = pd.DataFrame(hw_periodic_rows)
     report_df = pd.DataFrame(report_rows)
+    phase_fact_df = pd.DataFrame()
 
     wide_rows = list(wide_rows_map.values())
     wide_df = pd.DataFrame(wide_rows)
 
     # Derive phase summary from hardware tables.
-    phase_group_cols = ["run_id", "global_step", "phase_name", "phase_id", "source"]
+    phase_group_cols = ["run_id", "global_step_canonical", "phase_name", "phase_id", "source"]
 
     boundary_summary = pd.DataFrame(columns=phase_group_cols)
     if not hw_boundary_df.empty:
@@ -577,28 +602,42 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
     periodic_summary = pd.DataFrame(columns=phase_group_cols)
     if not hw_periodic_df.empty:
         p = hw_periodic_df.copy()
-        numeric_candidates = [
-            "gpu_power_mW",
-            "gpu_util_pct",
-            "sm_util_pct",
-            "mem_util_pct",
-            "temp_gpu_C",
-            "cpu_energy_uJ",
-        ]
-        for col in numeric_candidates:
-            if col in p.columns:
-                p[col] = pd.to_numeric(p[col], errors="coerce")
+        p = filter_periodic_to_phase_window(p, phase_instances_df)
+        p = add_time_weights(
+            p,
+            group_cols=["phase_instance_id", "source", "device_id"],
+            ts_col="ts_monotonic_ns",
+            out_col="sample_weight_ns",
+        )
 
-        agg_spec_p: Dict[str, Any] = {"device_id": "nunique"}
-        rename_map_p = {"device_id": "periodic_device_count"}
-        for col in numeric_candidates:
-            if col in p.columns:
-                agg_spec_p[col] = "mean"
-                rename_map_p[col] = f"periodic_{col}_mean"
-
-        periodic_summary = p.groupby(phase_group_cols, dropna=False).agg(agg_spec_p).reset_index().rename(columns=rename_map_p)
-        periodic_counts = p.groupby(phase_group_cols, dropna=False).size().reset_index(name="periodic_row_count")
-        periodic_summary = periodic_summary.merge(periodic_counts, on=phase_group_cols, how="outer")
+        numeric_metric_map = {
+            "periodic_gpu_power_mw": "gpu_power_mW",
+            "periodic_gpu_util_pct": "gpu_util_pct",
+            "periodic_sm_util_pct": "sm_util_pct",
+            "periodic_mem_util_pct": "mem_util_pct",
+            "periodic_temp_gpu_c": "temp_gpu_C",
+            "periodic_cpu_energy_uj": "cpu_energy_uJ",
+        }
+        bool_metric_map = {
+            "periodic_thr_sw_power_cap_frac": "thr_sw_power_cap",
+            "periodic_thr_thermal_slowdown_frac": "thr_thermal_slowdown",
+            "periodic_thr_hw_slowdown_frac": "thr_hw_slowdown",
+            "periodic_thr_hw_power_brake_frac": "thr_hw_power_brake",
+        }
+        periodic_summary = aggregate_periodic_metrics(
+            p,
+            group_cols=phase_group_cols,
+            numeric_metric_map=numeric_metric_map,
+            bool_metric_map=bool_metric_map,
+            weight_col="sample_weight_ns",
+            include_sample_mean=True,
+            include_time_weighted_mean=True,
+            sample_count_col="periodic_row_count",
+        )
+        periodic_device_counts = (
+            p.groupby(phase_group_cols, dropna=False)["device_id"].nunique().reset_index(name="periodic_device_count")
+        )
+        periodic_summary = periodic_summary.merge(periodic_device_counts, on=phase_group_cols, how="left")
 
     if not boundary_summary.empty and not periodic_summary.empty:
         phase_summary_df = boundary_summary.merge(periodic_summary, on=phase_group_cols, how="outer")
@@ -612,12 +651,69 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
     # Ensure key columns exist even for empty outputs.
     runs_df = _ensure_columns(runs_df, ["run_id", "run_dir", "logical_run_group", "is_resumed_run"])
     lineage_df = _ensure_columns(lineage_df, ["run_id", "is_resumed_run", "resume_parent_run_name", "resume_from_global_step"])
+    step_index_map_df = _ensure_columns(
+        step_index_map_df,
+        ["run_id", "raw_step", "raw_iteration", "canonical_step", "mismatch_flag", "observation_count"],
+    )
+    ingestion_checks_df = _ensure_columns(
+        ingestion_checks_df,
+        [
+            "run_id",
+            "raw_step_distinct_count",
+            "raw_iteration_distinct_count",
+            "overlap_distinct_count",
+            "raw_step_only_count",
+            "raw_iteration_only_count",
+            "mismatch_count",
+            "observation_count",
+            "mismatch_rate",
+            "join_coverage_rate",
+            "boundary_pair_integrity",
+            "boundary_pair_total",
+            "boundary_pair_valid",
+        ],
+    )
+    phase_instances_df = _ensure_columns(
+        phase_instances_df,
+        [
+            "run_id",
+            "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
+            "phase_name",
+            "phase_id",
+            "phase_instance_id",
+            "phase_start_ts_monotonic_ns",
+            "phase_end_ts_monotonic_ns",
+            "start_row_count",
+            "end_row_count",
+            "boundary_row_count",
+        ],
+    )
+    boundary_pair_integrity_df = _ensure_columns(
+        boundary_pair_integrity_df,
+        [
+            "run_id",
+            "boundary_pair_key",
+            "phase_instance_id",
+            "source",
+            "device_id",
+            "start_count",
+            "end_count",
+            "row_count",
+            "is_valid_pair",
+        ],
+    )
     metrics_long_df = _ensure_columns(
         metrics_long_df,
         [
             "run_id",
             "logical_run_group",
             "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
             "metric_key",
             "metric_type",
             "metric_value_float",
@@ -626,17 +722,54 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
             "validation_logged",
         ],
     )
-    wide_df = _ensure_columns(wide_df, ["run_id", "logical_run_group", "global_step", "validation_logged"])
+    wide_df = _ensure_columns(
+        wide_df,
+        [
+            "run_id",
+            "logical_run_group",
+            "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
+            "validation_logged",
+            "is_warmup_idle",
+            "is_validation_step",
+            "is_incomplete_phase",
+            "is_outlier_sample",
+        ],
+    )
     for key in CURATED_METRIC_KEYS:
         wide_df = _ensure_columns(wide_df, [curated_metric_cols[key]])
 
     phase_timings_df = _ensure_columns(
         phase_timings_df,
-        ["run_id", "logical_run_group", "global_step", "phase_name", "phase_id", "subphase_name", "value", "metric_unit"],
+        [
+            "run_id",
+            "logical_run_group",
+            "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
+            "phase_name",
+            "phase_id",
+            "subphase_name",
+            "value",
+            "metric_unit",
+        ],
     )
     tokens_df = _ensure_columns(
         tokens_df,
-        ["run_id", "logical_run_group", "global_step", "phase_name", "phase_id", "metric_scope"],
+        [
+            "run_id",
+            "logical_run_group",
+            "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
+            "phase_name",
+            "phase_id",
+            "metric_scope",
+        ],
     )
     hw_boundary_df = _ensure_columns(
         hw_boundary_df,
@@ -644,8 +777,13 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
             "run_id",
             "logical_run_group",
             "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
             "phase_name",
             "phase_id",
+            "phase_instance_id",
+            "boundary_pair_key",
             "source",
             "record_kind",
             "device_kind",
@@ -661,8 +799,13 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
             "run_id",
             "logical_run_group",
             "global_step",
+            "global_step_canonical",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
             "phase_name",
             "phase_id",
+            "phase_instance_id",
+            "boundary_pair_key",
             "source",
             "record_kind",
             "device_kind",
@@ -671,17 +814,223 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
             "ts_wall_ms",
         ],
     )
-    phase_summary_df = _ensure_columns(phase_summary_df, phase_group_cols)
+    phase_summary_df = _ensure_columns(
+        phase_summary_df,
+        phase_group_cols
+        + [
+            "global_step",
+            "global_step_raw_stepfield",
+            "global_step_raw_iterationfield",
+            "phase_instance_id",
+            "is_warmup_idle",
+            "is_validation_step",
+            "is_incomplete_phase",
+            "is_outlier_sample",
+        ],
+    )
+    phase_summary_periodic_cols = [
+        "periodic_gpu_power_mw_sample_mean",
+        "periodic_gpu_power_mw_twa",
+        "periodic_gpu_util_pct_sample_mean",
+        "periodic_gpu_util_pct_twa",
+        "periodic_sm_util_pct_sample_mean",
+        "periodic_sm_util_pct_twa",
+        "periodic_mem_util_pct_sample_mean",
+        "periodic_mem_util_pct_twa",
+        "periodic_temp_gpu_c_sample_mean",
+        "periodic_temp_gpu_c_twa",
+        "periodic_cpu_energy_uj_sample_mean",
+        "periodic_cpu_energy_uj_twa",
+        "periodic_thr_sw_power_cap_frac_sample_mean",
+        "periodic_thr_sw_power_cap_frac_twa",
+        "periodic_thr_thermal_slowdown_frac_sample_mean",
+        "periodic_thr_thermal_slowdown_frac_twa",
+        "periodic_thr_hw_slowdown_frac_sample_mean",
+        "periodic_thr_hw_slowdown_frac_twa",
+        "periodic_thr_hw_power_brake_frac_sample_mean",
+        "periodic_thr_hw_power_brake_frac_twa",
+        "periodic_row_count",
+        "periodic_device_count",
+    ]
+    phase_summary_df = _ensure_columns(phase_summary_df, phase_summary_periodic_cols)
     report_df = _ensure_columns(
         report_df,
-        ["run_dir", "run_id", "status", "reason", "included", "missing_files", "zero_line_files", "parse_error_files"],
+        [
+            "run_dir",
+            "run_id",
+            "status",
+            "reason",
+            "included",
+            "missing_files",
+            "zero_line_files",
+            "parse_error_files",
+            "analysis_mask_is_warmup_idle_count",
+            "analysis_mask_is_validation_step_count",
+            "analysis_mask_is_incomplete_phase_count",
+            "analysis_mask_is_outlier_sample_count",
+        ],
     )
+
+    # Keep both canonical and raw step fields visible in phase summary.
+    phase_summary_df["global_step"] = phase_summary_df["global_step_canonical"]
+    phase_summary_df["global_step_raw_stepfield"] = None
+    phase_summary_df["global_step_raw_iterationfield"] = phase_summary_df["global_step_canonical"]
+
+    phase_outlier_flags_df = build_phase_outlier_flags(hw_boundary_df)
+
+    # Canonical one-row-per-phase-instance fact table.
+    phase_fact_df = _build_phase_fact(
+        runs_df=runs_df,
+        phase_instances_df=phase_instances_df,
+        hw_boundary_df=hw_boundary_df,
+        hw_periodic_df=hw_periodic_df,
+        tokens_df=tokens_df,
+        validation_steps_by_run=validation_steps_by_run,
+        phase_outlier_flags_df=phase_outlier_flags_df,
+    )
+
+    # Propagate analysis masks to other phase/step outputs as appropriate.
+    phase_mask_cols = [
+        "run_id",
+        "phase_instance_id",
+        "is_warmup_idle",
+        "is_validation_step",
+        "is_incomplete_phase",
+        "is_outlier_sample",
+    ]
+    phase_mask_df = phase_fact_df[phase_mask_cols].copy() if not phase_fact_df.empty else pd.DataFrame(columns=phase_mask_cols)
+
+    if not phase_summary_df.empty:
+        phase_summary_df["phase_instance_id"] = phase_summary_df.apply(
+            lambda r: _stable_hash(r.get("run_id"), r.get("global_step_canonical"), r.get("phase_id"), r.get("phase_name")),
+            axis=1,
+        )
+        phase_summary_df = phase_summary_df.merge(phase_mask_df, on=["run_id", "phase_instance_id"], how="left")
+        for c in ["is_warmup_idle", "is_validation_step", "is_incomplete_phase", "is_outlier_sample"]:
+            phase_summary_df = _coalesce_join_column(phase_summary_df, c, default=False, cast="bool")
+
+    if not wide_df.empty:
+        val_map = (
+            phase_fact_df.groupby(["run_id", "global_step_canonical"], dropna=False)["is_validation_step"]
+            .max()
+            .reset_index()
+            if not phase_fact_df.empty
+            else pd.DataFrame(columns=["run_id", "global_step_canonical", "is_validation_step"])
+        )
+        wide_df = wide_df.merge(val_map, on=["run_id", "global_step_canonical"], how="left")
+        if "is_validation_step" not in wide_df.columns:
+            if "is_validation_step_y" in wide_df.columns:
+                wide_df["is_validation_step"] = wide_df["is_validation_step_y"]
+            elif "is_validation_step_x" in wide_df.columns:
+                wide_df["is_validation_step"] = wide_df["is_validation_step_x"]
+            else:
+                wide_df["is_validation_step"] = False
+        wide_df["is_validation_step"] = wide_df["is_validation_step"].fillna(False).astype(bool)
+        wide_df["is_warmup_idle"] = (
+            (pd.to_numeric(wide_df["global_step_canonical"], errors="coerce") == 0)
+            & (wide_df.get("phase_name", pd.Series([None] * len(wide_df))) == "idle")
+        )
+        step_incomplete = (
+            phase_fact_df.groupby(["run_id", "global_step_canonical"], dropna=False)["is_incomplete_phase"]
+            .max()
+            .reset_index()
+            if not phase_fact_df.empty
+            else pd.DataFrame(columns=["run_id", "global_step_canonical", "is_incomplete_phase"])
+        )
+        step_outlier = (
+            phase_fact_df.groupby(["run_id", "global_step_canonical"], dropna=False)["is_outlier_sample"]
+            .max()
+            .reset_index()
+            if not phase_fact_df.empty
+            else pd.DataFrame(columns=["run_id", "global_step_canonical", "is_outlier_sample"])
+        )
+        wide_df = wide_df.merge(step_incomplete, on=["run_id", "global_step_canonical"], how="left")
+        wide_df = wide_df.merge(step_outlier, on=["run_id", "global_step_canonical"], how="left")
+        for c in ["is_incomplete_phase", "is_outlier_sample"]:
+            if c not in wide_df.columns:
+                if f"{c}_y" in wide_df.columns:
+                    wide_df[c] = wide_df[f"{c}_y"]
+                elif f"{c}_x" in wide_df.columns:
+                    wide_df[c] = wide_df[f"{c}_x"]
+                else:
+                    wide_df[c] = False
+            wide_df[c] = wide_df[c].fillna(False).astype(bool)
+        for c in ["is_warmup_idle", "is_validation_step", "is_incomplete_phase", "is_outlier_sample"]:
+            wide_df = _coalesce_join_column(wide_df, c, default=False, cast="bool")
+
+    if not report_df.empty and not phase_fact_df.empty:
+        run_mask_counts = (
+            phase_fact_df.groupby("run_id", dropna=False)
+            .agg(
+                analysis_mask_is_warmup_idle_count=("is_warmup_idle", "sum"),
+                analysis_mask_is_validation_step_count=("is_validation_step", "sum"),
+                analysis_mask_is_incomplete_phase_count=("is_incomplete_phase", "sum"),
+                analysis_mask_is_outlier_sample_count=("is_outlier_sample", "sum"),
+            )
+            .reset_index()
+        )
+        report_df = report_df.merge(run_mask_counts, on="run_id", how="left")
+        for c in [
+            "analysis_mask_is_warmup_idle_count",
+            "analysis_mask_is_validation_step_count",
+            "analysis_mask_is_incomplete_phase_count",
+            "analysis_mask_is_outlier_sample_count",
+        ]:
+            if c not in report_df.columns:
+                left = f"{c}_x"
+                right = f"{c}_y"
+                if left in report_df.columns and right in report_df.columns:
+                    report_df[c] = pd.to_numeric(report_df[right], errors="coerce").fillna(
+                        pd.to_numeric(report_df[left], errors="coerce")
+                    )
+                elif right in report_df.columns:
+                    report_df[c] = report_df[right]
+                elif left in report_df.columns:
+                    report_df[c] = report_df[left]
+                else:
+                    report_df[c] = 0
+    if not report_df.empty:
+        for c in [
+            "analysis_mask_is_warmup_idle_count",
+            "analysis_mask_is_validation_step_count",
+            "analysis_mask_is_incomplete_phase_count",
+            "analysis_mask_is_outlier_sample_count",
+        ]:
+            report_df = _coalesce_join_column(report_df, c, default=0, cast="int")
+
+    # Make absence explicit for count-like phase summary fields.
+    if not phase_summary_df.empty:
+        for c in [
+            "boundary_device_count",
+            "boundary_row_count",
+            "periodic_row_count",
+            "periodic_device_count",
+        ]:
+            if c in phase_summary_df.columns:
+                phase_summary_df[c] = pd.to_numeric(phase_summary_df[c], errors="coerce").fillna(0).astype(int)
+
+    # Hard-fail invariants are centralized in ingestion_checks.py.
+    total_mismatch_count, min_boundary_pair_integrity = validate_ingestion_checks(ingestion_checks_df)
 
     # Stable sort for reproducibility.
     if not runs_df.empty:
         runs_df = runs_df.sort_values(["run_id"]).reset_index(drop=True)
     if not lineage_df.empty:
         lineage_df = lineage_df.sort_values(["run_id"]).reset_index(drop=True)
+    if not step_index_map_df.empty:
+        step_index_map_df = step_index_map_df.sort_values(
+            ["run_id", "canonical_step", "raw_step", "raw_iteration", "mismatch_flag"]
+        ).reset_index(drop=True)
+    if not ingestion_checks_df.empty:
+        ingestion_checks_df = ingestion_checks_df.sort_values(["run_id"]).reset_index(drop=True)
+    if not phase_instances_df.empty:
+        phase_instances_df = phase_instances_df.sort_values(
+            ["run_id", "global_step_canonical", "phase_id", "phase_name"]
+        ).reset_index(drop=True)
+    if not boundary_pair_integrity_df.empty:
+        boundary_pair_integrity_df = boundary_pair_integrity_df.sort_values(
+            ["run_id", "phase_instance_id", "source", "device_id"]
+        ).reset_index(drop=True)
     if not metrics_long_df.empty:
         metrics_long_df = metrics_long_df.sort_values(["run_id", "global_step", "metric_key"]).reset_index(drop=True)
     if not wide_df.empty:
@@ -702,8 +1051,57 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
         ).reset_index(drop=True)
     if not phase_summary_df.empty:
         phase_summary_df = phase_summary_df.sort_values(phase_group_cols).reset_index(drop=True)
+    if not phase_fact_df.empty:
+        phase_fact_df = phase_fact_df.sort_values(
+            ["run_id", "global_step_canonical", "phase_id", "phase_name", "phase_instance_id"]
+        ).reset_index(drop=True)
     if not report_df.empty:
+        for c in [
+            "analysis_mask_is_warmup_idle_count",
+            "analysis_mask_is_validation_step_count",
+            "analysis_mask_is_incomplete_phase_count",
+            "analysis_mask_is_outlier_sample_count",
+        ]:
+            report_df[c] = pd.to_numeric(report_df[c], errors="coerce").fillna(0).astype(int)
         report_df = report_df.sort_values(["included", "run_id", "run_dir"], ascending=[False, True, True]).reset_index(drop=True)
+
+    analysis_views = _build_analysis_views(
+        runs_df=runs_df,
+        lineage_df=lineage_df,
+        phase_fact_df=phase_fact_df,
+        wide_df=wide_df,
+        hw_periodic_df=hw_periodic_df,
+        hw_boundary_df=hw_boundary_df,
+        ingestion_checks_df=ingestion_checks_df,
+        report_df=report_df,
+    )
+    phase_fact_view_df = analysis_views["phase_fact_view"]
+    step_fact_view_df = analysis_views["step_fact_view"]
+    run_summary_view_df = analysis_views["run_summary_view"]
+    comparison_view_df = analysis_views["comparison_view"]
+    device_timeseries_view_df = analysis_views["device_timeseries_view"]
+    integrity_view_df = analysis_views["integrity_view"]
+
+    if not phase_fact_view_df.empty:
+        phase_fact_view_df = phase_fact_view_df.sort_values(
+            ["run_id", "global_step_canonical", "phase_id", "phase_name", "phase_instance_id"]
+        ).reset_index(drop=True)
+    if not step_fact_view_df.empty:
+        step_fact_view_df = step_fact_view_df.sort_values(
+            ["run_id", "global_step_canonical"]
+        ).reset_index(drop=True)
+    if not run_summary_view_df.empty:
+        run_summary_view_df = run_summary_view_df.sort_values(["run_id"]).reset_index(drop=True)
+    if not comparison_view_df.empty:
+        comparison_view_df = comparison_view_df.sort_values(
+            ["policy", "model", "experiment_variant", "is_checkpoint_continuation"]
+        ).reset_index(drop=True)
+    if not device_timeseries_view_df.empty:
+        device_timeseries_view_df = device_timeseries_view_df.sort_values(
+            ["run_id", "global_step_canonical", "phase_name", "phase_id", "device_kind", "device_id", "ts_monotonic_ns"]
+        ).reset_index(drop=True)
+    if not integrity_view_df.empty:
+        integrity_view_df = integrity_view_df.sort_values(["run_id"]).reset_index(drop=True)
 
     # Serialize list/dict report fields as JSON strings for Parquet compatibility.
     for col in ["missing_files", "zero_line_files", "parse_error_files"]:
@@ -712,6 +1110,10 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
     outputs = {
         "runs": runs_df,
         "run_lineage": lineage_df,
+        "step_index_map": step_index_map_df,
+        "ingestion_checks": ingestion_checks_df,
+        "phase_instances": phase_instances_df,
+        "boundary_pair_integrity": boundary_pair_integrity_df,
         "step_metrics_long": metrics_long_df,
         "step_metrics_wide_curated": wide_df,
         "phase_timings_long": phase_timings_df,
@@ -719,7 +1121,14 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
         "hardware_boundary": hw_boundary_df,
         "hardware_periodic": hw_periodic_df,
         "phase_summary": phase_summary_df,
+        "phase_fact": phase_fact_df,
         "ingestion_report": report_df,
+        "phase_fact_view": phase_fact_view_df,
+        "step_fact_view": step_fact_view_df,
+        "run_summary_view": run_summary_view_df,
+        "comparison_view": comparison_view_df,
+        "device_timeseries_view": device_timeseries_view_df,
+        "integrity_view": integrity_view_df,
     }
 
     for key, df in outputs.items():
@@ -728,12 +1137,20 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
 
     included_runs = int(report_df["included"].astype(bool).sum()) if not report_df.empty else 0
     excluded_runs = int((~report_df["included"].astype(bool)).sum()) if not report_df.empty else 0
+    min_join_coverage = (
+        float(pd.to_numeric(ingestion_checks_df["join_coverage_rate"], errors="coerce").min())
+        if not ingestion_checks_df.empty
+        else 1.0
+    )
 
     print("Dataset build complete")
     print(f"  Results root: {results_root}")
     print(f"  Output root:  {output_root}")
     print(f"  Included runs: {included_runs}")
     print(f"  Excluded runs: {excluded_runs}")
+    print(f"  Total mismatch count: {total_mismatch_count}")
+    print(f"  Min join coverage rate: {min_join_coverage:.6f}")
+    print(f"  Min boundary pair integrity: {min_boundary_pair_integrity:.6f}")
     print("  Wrote tables:")
     for key in TABLE_FILES:
         print(f"    - {TABLE_FILES[key]}")
