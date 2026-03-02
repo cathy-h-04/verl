@@ -1,8 +1,8 @@
 {
   "runs": [
     {
-      "name": "qwen_smoke_test",
-      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "name": "stage1_llama8b_ppo_cap560w",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
       "total_epochs": 1,
       "poll_interval": 0.5,
       "granularity": "operation",
@@ -15,6 +15,7 @@
       "val_max_samples": 128,
       "total_steps": 3,
       "save_freq": -1,
+      "power_cap_w": 560,
       "resume_path": null,
       "rollout_n": 1,
       "tensor_parallel_size": 1,
