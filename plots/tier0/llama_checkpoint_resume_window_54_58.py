@@ -27,12 +27,23 @@ from plots.plotting.filters import apply_analysis_ok, explain_filtering
 
 
 OUTPATH = Path("plots/out/figures/tier0/llama_checkpoint_resume_window_54_58.png")
+OUTPATH_ACCURACY = Path("plots/out/figures/tier0/llama_checkpoint_resume_accuracy_path_to_58.png")
 
 MODEL_EXACT = "meta-llama/Llama-3.1-8B-Instruct"
 POLICY_ORDER = ("ppo", "remax", "grpo")
 ROLLOUT_MAX_BATCHED_TOKENS = 8192
 WINDOW_START = 54
 WINDOW_END = 58
+BASELINE_RUN_IDS = {
+    "stage1_llama8b_ppo_20260301_075906",
+    "stage1_llama8b_remax_20260301_083423",
+    "stage1_llama8b_grpo_20260301_090832",
+}
+CONTINUATION_RUN_IDS = {
+    "stage2_llama8b_ppo_20260301_120523",
+    "stage2_llama8b_remax_20260301_121545",
+    "stage2_llama8b_grpo_20260301_122602",
+}
 
 COHORT_LABELS = {False: "baseline", True: "continuation"}
 COHORT_ORDER = ("baseline", "continuation")
@@ -48,6 +59,7 @@ METRIC_COLUMNS = [
     "straggler_ratio",
     REQUESTED_IMBALANCE_METRIC,
 ]
+ACCURACY_METRIC_KEY = "val-core/openai/gsm8k/reward/mean@1"
 METRIC_LABELS = {
     "step_j_per_output_token": "overall_j_per_output_token (step mean)",
     "rollout_j_per_output_token": "rollout_j_per_output_token",
@@ -90,12 +102,23 @@ def _load_selected_runs() -> pd.DataFrame:
         & (runs["phase_boundary_integrity_rate"] == 1.0)
     )
 
-    mask = (
+    base_mask = (
         (runs["model"] == MODEL_EXACT)
         & runs["policy_norm"].isin(POLICY_ORDER)
         & (runs["rollout_max_batched_tokens"] == float(ROLLOUT_MAX_BATCHED_TOKENS))
         & integrity_ok
+        & (~runs["is_checkpoint_continuation"])
+        & runs["run_id"].isin(BASELINE_RUN_IDS)
     )
+    continuation_mask = (
+        (runs["model"] == MODEL_EXACT)
+        & runs["policy_norm"].isin(POLICY_ORDER)
+        & (runs["rollout_max_batched_tokens"] == float(ROLLOUT_MAX_BATCHED_TOKENS))
+        & integrity_ok
+        & runs["is_checkpoint_continuation"]
+        & runs["run_id"].isin(CONTINUATION_RUN_IDS)
+    )
+    mask = base_mask | continuation_mask
 
     selected = runs.loc[mask, ["run_id", "policy_norm", "is_checkpoint_continuation"]].copy()
     selected["cohort"] = selected["is_checkpoint_continuation"].map(COHORT_LABELS)
@@ -112,6 +135,14 @@ def _load_selected_runs() -> pd.DataFrame:
             f"Missing required policy/cohort groups: {sorted(expected-got)}. "
             f"Available Llama configs: {available}"
         )
+    missing_baselines = sorted(BASELINE_RUN_IDS - set(selected.loc[selected["cohort"] == "baseline", "run_id"].tolist()))
+    missing_continuations = sorted(
+        CONTINUATION_RUN_IDS - set(selected.loc[selected["cohort"] == "continuation", "run_id"].tolist())
+    )
+    if missing_baselines:
+        raise ValueError(f"Missing required baseline run_ids after filtering: {missing_baselines}")
+    if missing_continuations:
+        raise ValueError(f"Missing required continuation run_ids after filtering: {missing_continuations}")
 
     return selected
 
@@ -144,6 +175,7 @@ def main() -> None:
     before_filter = step.copy()
     step = apply_analysis_ok(step)
     print(f"filtering={explain_filtering(before_filter, step)}")
+    eligible_steps_all = step[["run_id", "global_step_canonical"]].drop_duplicates().copy()
 
     step["global_step_canonical"] = pd.to_numeric(step["global_step_canonical"], errors="coerce")
     step = step[(step["global_step_canonical"] >= WINDOW_START) & (step["global_step_canonical"] <= WINDOW_END)].copy()
@@ -273,6 +305,86 @@ def main() -> None:
     fig.savefig(OUTPATH, format="png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {OUTPATH}")
+
+    # Accuracy path figure (up to step 58): baseline trajectory vs continuation checkpoint-step point.
+    step_long, _ = load_view("step_metrics_long")
+    required_long = ["run_id", "global_step_canonical", "metric_key", "metric_value_float"]
+    missing_long = [c for c in required_long if c not in step_long.columns]
+    if missing_long:
+        raise ValueError(f"step_metrics_long missing required columns for accuracy plot: {missing_long}")
+
+    acc = step_long[step_long["metric_key"] == ACCURACY_METRIC_KEY][required_long].copy()
+    acc = acc[acc["run_id"].astype(str).isin(selected_runs["run_id"])].copy()
+    acc["global_step_canonical"] = pd.to_numeric(acc["global_step_canonical"], errors="coerce")
+    acc["metric_value_float"] = pd.to_numeric(acc["metric_value_float"], errors="coerce")
+    acc = acc.dropna(subset=["global_step_canonical", "metric_value_float"]).copy()
+    acc = acc[acc["global_step_canonical"] <= WINDOW_END].copy()
+    acc = acc.merge(selected_runs[["run_id", "policy_norm", "cohort"]], on="run_id", how="inner")
+
+    if acc.empty:
+        print("warning: no accuracy rows found after filtering; skipping accuracy path figure.")
+        return
+
+    acc_summary = (
+        acc.groupby(["policy_norm", "cohort", "global_step_canonical"], dropna=False)["metric_value_float"]
+        .mean()
+        .reset_index()
+        .sort_values(["policy_norm", "cohort", "global_step_canonical"])
+    )
+    print("accuracy rows by policy/cohort (n_runs, n_steps):")
+    acc_counts = (
+        acc.groupby(["policy_norm", "cohort"], dropna=False)
+        .agg(n_runs=("run_id", "nunique"), n_steps=("global_step_canonical", "nunique"))
+        .reset_index()
+        .sort_values(["policy_norm", "cohort"])
+    )
+    print(acc_counts.to_string(index=False))
+    print("accuracy series used for plotting:")
+    print(acc_summary.to_string(index=False))
+
+    fig2, axes2 = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+    policy_to_ax = dict(zip(POLICY_ORDER, axes2))
+    for policy in POLICY_ORDER:
+        ax = policy_to_ax[policy]
+        for cohort in COHORT_ORDER:
+            sub = acc_summary[(acc_summary["policy_norm"] == policy) & (acc_summary["cohort"] == cohort)].copy()
+            if sub.empty:
+                continue
+            sub = sub.sort_values("global_step_canonical")
+            ax.plot(
+                sub["global_step_canonical"],
+                sub["metric_value_float"],
+                marker="o",
+                linewidth=1.8,
+                markersize=5.0,
+                color=COHORT_COLORS[cohort],
+                label=cohort if policy == POLICY_ORDER[0] else None,
+            )
+            # Label final point for quick readout at/near iteration 58.
+            last = sub.iloc[-1]
+            ax.text(
+                float(last["global_step_canonical"]) + 0.3,
+                float(last["metric_value_float"]),
+                f"{float(last['metric_value_float']):.3f}",
+                fontsize=8,
+                ha="left",
+                va="center",
+                color=COHORT_COLORS[cohort],
+            )
+        ax.set_title(policy.upper())
+        ax.set_xlabel("global_step_canonical")
+        ax.grid(alpha=0.2)
+        ax.set_xlim(9, WINDOW_END + 2)
+
+    axes2[0].set_ylabel("validation accuracy (gsm8k reward@1)")
+    axes2[0].legend(title="cohort", frameon=False, loc="lower right")
+    fig2.suptitle("Accuracy path to iteration 58: baseline vs checkpoint continuation", y=0.99)
+    fig2.tight_layout(rect=(0, 0, 1, 0.93))
+
+    OUTPATH_ACCURACY.parent.mkdir(parents=True, exist_ok=True)
+    fig2.savefig(OUTPATH_ACCURACY, format="png", dpi=300, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"wrote {OUTPATH_ACCURACY}")
 
 
 if __name__ == "__main__":

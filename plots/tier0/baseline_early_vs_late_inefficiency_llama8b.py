@@ -1,4 +1,4 @@
-"""Baseline early-vs-late inefficiency comparison (Llama 8B, 8192 rollout cap).
+"""Baseline early-vs-late comparison (Llama 8B, 8192 rollout cap).
 
 Windows are computed per run on eligible non-validation steps:
 - early = first 10 iterations
@@ -25,17 +25,23 @@ MODEL_EXACT = "meta-llama/Llama-3.1-8B-Instruct"
 POLICY_ORDER = ("ppo", "remax", "grpo")
 ROLLOUT_MAX_BATCHED_TOKENS = 8192
 WINDOW_SIZE = 10
+BASELINE_RUN_IDS = {
+    "stage1_llama8b_ppo_20260301_075906",
+    "stage1_llama8b_remax_20260301_083423",
+    "stage1_llama8b_grpo_20260301_090832",
+}
 
 WINDOW_ORDER = ("early", "late")
 WINDOW_COLORS = {"early": "#4c78a8", "late": "#f58518"}
 REQUESTED_IMBALANCE_METRIC = "timing_dist_s/update_actor/imbalance"
 FALLBACK_IMBALANCE_METRIC = "sync_efficiency"
+TOTAL_OUTPUT_TOKENS_METRIC = "window_total_output_tokens"
 
 METRICS = [
-    ("step_j_per_output_token", "overall_j_per_output_token"),
-    ("rollout_j_per_output_token", "rollout_j_per_output_token"),
-    ("train_j_per_effective_token", "train_j_per_effective_token"),
-    ("mfu_actor", "mfu_actor"),
+    ("step_total_energy_j", "step_total_energy_j"),
+    ("step_rollout_output_tokens", "step_rollout_output_tokens"),
+    ("step_train_tokens_est", "step_train_tokens_est"),
+    (TOTAL_OUTPUT_TOKENS_METRIC, "total_output_tokens (window sum)"),
     ("straggler_ratio", "straggler_ratio (lower better)"),
     (REQUESTED_IMBALANCE_METRIC, "timing_dist_s/update_actor/imbalance (lower better)"),
 ]
@@ -74,6 +80,7 @@ def _load_selected_runs() -> pd.DataFrame:
         & runs["policy_norm"].isin(POLICY_ORDER)
         & (runs["rollout_max_batched_tokens"] == float(ROLLOUT_MAX_BATCHED_TOKENS))
         & (~runs["is_checkpoint_continuation"])
+        & runs["run_id"].isin(BASELINE_RUN_IDS)
         & integrity_ok
     )
     selected = runs.loc[mask, ["run_id", "policy_norm"]].copy()
@@ -83,6 +90,9 @@ def _load_selected_runs() -> pd.DataFrame:
     missing_policies = sorted(set(POLICY_ORDER) - set(selected["policy_norm"].unique().tolist()))
     if missing_policies:
         raise ValueError(f"Missing baseline runs for policies: {missing_policies}")
+    missing_runs = sorted(BASELINE_RUN_IDS - set(selected["run_id"].tolist()))
+    if missing_runs:
+        raise ValueError(f"Missing required baseline run_ids after filtering: {missing_runs}")
     return selected
 
 
@@ -105,7 +115,8 @@ def main() -> None:
             "warning: requested metric 'timing_dist_s/update_actor/imbalance' not found in step_fact_view; "
             "using sync_efficiency as fallback source."
         )
-    required_cols = ["run_id", "policy", "model", "global_step_canonical", *[m for m, _ in METRICS]]
+    base_metric_cols = [m for m, _ in METRICS if m != TOTAL_OUTPUT_TOKENS_METRIC]
+    required_cols = ["run_id", "policy", "model", "global_step_canonical", *base_metric_cols]
     missing = [c for c in required_cols if c not in step.columns]
     if missing:
         raise ValueError(f"step_fact_view missing required columns: {missing}")
@@ -120,7 +131,7 @@ def main() -> None:
         step = step[~step["is_validation_step"].fillna(False).astype(bool)].copy()
 
     step["global_step_canonical"] = pd.to_numeric(step["global_step_canonical"], errors="coerce")
-    for metric, _ in METRICS:
+    for metric in base_metric_cols:
         step[metric] = pd.to_numeric(step[metric], errors="coerce")
     step = step.dropna(subset=["global_step_canonical"]).copy()
     step = step.merge(selected_runs, on="run_id", how="inner")
@@ -143,8 +154,12 @@ def main() -> None:
         early_row: dict[str, object] = {"run_id": str(run_id), "policy_norm": policy, "window": "early", "n_steps": int(len(early_df))}
         late_row: dict[str, object] = {"run_id": str(run_id), "policy_norm": policy, "window": "late", "n_steps": int(len(late_df))}
         for metric, _ in METRICS:
-            early_row[metric] = float(early_df[metric].mean())
-            late_row[metric] = float(late_df[metric].mean())
+            if metric == TOTAL_OUTPUT_TOKENS_METRIC:
+                early_row[metric] = float(early_df["step_rollout_output_tokens"].sum())
+                late_row[metric] = float(late_df["step_rollout_output_tokens"].sum())
+            else:
+                early_row[metric] = float(early_df[metric].mean())
+                late_row[metric] = float(late_df[metric].mean())
         per_run_records.append(early_row)
         per_run_records.append(late_row)
 
@@ -241,7 +256,7 @@ def main() -> None:
     for ax in axes[3:]:
         ax.set_xlabel("policy")
 
-    fig.suptitle("Baseline Early vs Late Inefficiency (Llama 8B)", y=0.99)
+    fig.suptitle("Baseline Early vs Late (Llama 8B): Joules and Tokens Kept Separate", y=0.99)
     fig.text(
         0.5,
         0.95,

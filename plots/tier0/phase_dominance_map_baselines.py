@@ -18,7 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import pandas as pd
 
 from plots.data.loader import load_view
@@ -27,9 +27,14 @@ from plots.plotting.filters import apply_analysis_ok, explain_filtering
 
 INCLUDE_VALIDATION = False
 OUTPATH = Path("plots/out/figures/tier0/phase_dominance_map_baselines.png")
+TARGET_SLURM_JOB_NAME_BY_FACET = {
+    "Llama": "llama_new_baseline",
+    "Qwen": "qwen_new_baseline",
+}
 TARGET_POLICIES = {"ppo", "remax", "grpo"}
 TARGET_MODEL_FACETS = ("Llama", "Qwen")
 BASELINE_GROUP_PREFIXES = ("stage1_llama8b_", "qwen_sys_3b_")
+PHASE_ORDER = ("rollout", "training", "rl_policy")
 
 POLICY_COLORS = {
     "ppo": "#1f77b4",
@@ -37,10 +42,10 @@ POLICY_COLORS = {
     "grpo": "#2ca02c",
 }
 
-PHASE_MARKERS = {
-    "rollout": "o",
-    "training": "s",
-    "rl_policy": "^",
+PHASE_COLORS = {
+    "rollout": "#4C78A8",
+    "training": "#F58518",
+    "rl_policy": "#54A24B",
 }
 
 
@@ -98,9 +103,23 @@ def _load_run_summary_for_selection() -> pd.DataFrame:
     return df_runs.copy()
 
 
+def _load_runs_with_slurm_metadata() -> pd.DataFrame:
+    df_runs, _ = load_view("runs")
+    required = ["run_id", "slurm_job_name"]
+    missing = [col for col in required if col not in df_runs.columns]
+    if missing:
+        raise ValueError(
+            "runs is missing required slurm metadata columns "
+            f"{missing}. Available columns: {list(df_runs.columns)}"
+        )
+    return df_runs[required].copy()
+
+
 def main() -> None:
     phase_df = _load_phase_fact_for_plot()
     runs_df = _load_run_summary_for_selection()
+    runs_meta_df = _load_runs_with_slurm_metadata()
+    runs_df = runs_df.merge(runs_meta_df, on="run_id", how="left", validate="one_to_one")
 
     runs_df["policy_norm"] = runs_df["policy"].astype(str).str.lower()
     runs_df["model_facet"] = runs_df["model"].map(_model_facet)
@@ -114,21 +133,27 @@ def main() -> None:
     baseline_label_mask = logical_group.str.startswith(BASELINE_GROUP_PREFIXES, na=False)
     non_rollout_knob_mask = ~logical_group.str.contains(r"rollout|knob|cap", na=False)
     target_pair_mask = runs_df["policy_norm"].isin(TARGET_POLICIES) & runs_df["model_facet"].isin(TARGET_MODEL_FACETS)
+    expected_slurm_job_name = runs_df["model_facet"].map(TARGET_SLURM_JOB_NAME_BY_FACET).astype(str).str.lower()
+    slurm_job_mask = runs_df["slurm_job_name"].astype(str).str.lower() == expected_slurm_job_name
     checkpoint_mask = (
         ~runs_df["is_checkpoint_continuation"].fillna(False).astype(bool)
         if "is_checkpoint_continuation" in runs_df.columns
         else True
     )
 
-    selected_runs = runs_df[baseline_label_mask & non_rollout_knob_mask & target_pair_mask & checkpoint_mask].copy()
+    selected_runs = runs_df[
+        baseline_label_mask & non_rollout_knob_mask & target_pair_mask & checkpoint_mask & slurm_job_mask
+    ].copy()
     if selected_runs.empty:
         raise ValueError(
             "No baseline runs selected. Debug hints: "
+            f"requires slurm_job_name_by_model_facet={TARGET_SLURM_JOB_NAME_BY_FACET}, "
             f"target_policies={sorted(TARGET_POLICIES)}, "
             f"target_model_facets={TARGET_MODEL_FACETS}, "
             f"requires logical_run_group prefixes={BASELINE_GROUP_PREFIXES}, "
             "excludes logical_run_group containing rollout/knob/cap, "
             f"available logical_run_group sample={runs_df['logical_run_group'].dropna().astype(str).unique()[:15].tolist()}, "
+            f"available slurm_job_name sample={runs_df['slurm_job_name'].dropna().astype(str).unique()[:15].tolist()}, "
             f"available (model, policy) sample={runs_df[['model','policy']].dropna().drop_duplicates().head(15).to_dict(orient='records')}"
         )
 
@@ -164,6 +189,8 @@ def main() -> None:
     )
     print("runs included by (model, policy):")
     print(run_counts.to_string(index=False))
+    print("selected run_ids:")
+    print(selected_runs[["run_id", "slurm_job_name", "model_facet", "policy_norm"]].sort_values(["model_facet", "policy_norm"]).to_string(index=False))
 
     point_counts = (
         plot_df.groupby(["model_facet", "policy_norm", "phase_bucket"], dropna=False)
@@ -175,69 +202,69 @@ def main() -> None:
     print("points plotted by (model, policy, phase_bucket):")
     print(point_counts.to_string(index=False))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
-    facet_axes = dict(zip(TARGET_MODEL_FACETS, axes))
+    fig, axes = plt.subplots(
+        len(TARGET_MODEL_FACETS),
+        len(sorted(TARGET_POLICIES)),
+        figsize=(14, 9),
+        subplot_kw={"aspect": "equal"},
+    )
+    if len(TARGET_MODEL_FACETS) == 1:
+        axes = [axes]
 
-    for facet in TARGET_MODEL_FACETS:
-        ax = facet_axes[facet]
+    for row_idx, facet in enumerate(TARGET_MODEL_FACETS):
         facet_df = plot_df[plot_df["model_facet"] == facet]
+        for col_idx, policy in enumerate(sorted(TARGET_POLICIES)):
+            ax = axes[row_idx][col_idx]
+            combo_df = facet_df[facet_df["policy_norm"] == policy]
 
-        for policy in sorted(TARGET_POLICIES):
-            policy_df = facet_df[facet_df["policy_norm"] == policy]
-            for bucket, bucket_df in policy_df.groupby("phase_bucket", dropna=False):
-                ax.scatter(
-                    bucket_df["time_share"],
-                    bucket_df["energy_share"],
-                    s=52,
-                    marker=PHASE_MARKERS.get(str(bucket), "o"),
-                    color=POLICY_COLORS.get(policy, "#333333"),
-                    edgecolor="black",
-                    linewidth=0.45,
-                    alpha=0.75,
-                    zorder=3,
-                )
+            phase_means = (
+                combo_df.groupby("phase_bucket", dropna=False)[["time_share", "energy_share"]]
+                .mean()
+                .reindex(PHASE_ORDER)
+                .fillna(0.0)
+            )
+            time_vals = phase_means["time_share"].clip(lower=0.0).to_numpy()
+            energy_vals = phase_means["energy_share"].clip(lower=0.0).to_numpy()
+            phase_labels = list(PHASE_ORDER)
+            colors = [PHASE_COLORS[p] for p in phase_labels]
+            nonzero_total = float(time_vals.sum() + energy_vals.sum())
 
-        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, color="black", alpha=0.7)
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.set_xlabel("time_share")
-        ax.set_title(facet)
-        ax.grid(alpha=0.2)
+            if nonzero_total <= 0:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=10)
+                ax.set_axis_off()
+                continue
+
+            ax.pie(
+                energy_vals if energy_vals.sum() > 0 else [1.0],
+                labels=phase_labels if energy_vals.sum() > 0 else [""],
+                colors=colors if energy_vals.sum() > 0 else ["#D9D9D9"],
+                radius=1.0,
+                wedgeprops={"width": 0.32, "edgecolor": "white", "linewidth": 0.8},
+                textprops={"fontsize": 8},
+                labeldistance=1.05,
+            )
+            ax.pie(
+                time_vals if time_vals.sum() > 0 else [1.0],
+                labels=None,
+                colors=colors if time_vals.sum() > 0 else ["#BDBDBD"],
+                radius=0.66,
+                wedgeprops={"width": 0.32, "edgecolor": "white", "linewidth": 0.8},
+            )
+
+            n_runs = selected_runs[
+                (selected_runs["model_facet"] == facet) & (selected_runs["policy_norm"] == policy)
+            ]["run_id"].nunique()
+            ax.set_title(f"{facet} | {policy}\nouter=energy_share, inner=time_share, n_runs={n_runs}", fontsize=10)
 
     policy_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="None",
-            color=POLICY_COLORS[policy],
-            markerfacecolor=POLICY_COLORS[policy],
-            markeredgecolor="black",
-            markersize=8,
-            label=policy,
-        )
-        for policy in sorted(TARGET_POLICIES)
+        Patch(facecolor=POLICY_COLORS[policy], edgecolor="black", label=policy) for policy in sorted(TARGET_POLICIES)
     ]
-    phase_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker=PHASE_MARKERS[phase],
-            linestyle="None",
-            color="black",
-            markerfacecolor="white",
-            markeredgecolor="black",
-            markersize=8,
-            label=phase,
-        )
-        for phase in ["rollout", "training", "rl_policy"]
-    ]
+    phase_handles = [Patch(facecolor=PHASE_COLORS[phase], edgecolor="black", label=phase) for phase in PHASE_ORDER]
 
-    axes[0].set_ylabel("energy_share")
-    fig.suptitle("Phase dominance map: time share vs energy share", y=0.99)
-    fig.legend(handles=policy_handles, title="policy (color)", loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.33, 0.955))
-    fig.legend(handles=phase_handles, title="phase (shape)", loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.76, 0.955))
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.suptitle("Phase dominance pies by model/policy", y=0.99)
+    fig.legend(handles=policy_handles, title="policy groups", loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.3, 0.965))
+    fig.legend(handles=phase_handles, title="phase colors", loc="upper center", ncol=3, frameon=False, bbox_to_anchor=(0.74, 0.965))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
 
     OUTPATH.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUTPATH, format="png", dpi=300, bbox_inches="tight")

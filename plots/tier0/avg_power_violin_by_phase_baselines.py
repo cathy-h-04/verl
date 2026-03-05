@@ -22,6 +22,10 @@ from plots.plotting.filters import apply_analysis_ok, explain_filtering
 OUTPATH = Path("plots/out/figures/tier0/avg_power_violin_by_phase_baselines.png")
 INCLUDE_VALIDATION = False
 
+TARGET_SLURM_JOB_NAME_BY_FACET = {
+    "Llama": "llama_new_baseline",
+    "Qwen": "qwen_new_baseline",
+}
 TARGET_POLICIES = {"ppo", "remax", "grpo"}
 TARGET_MODEL_FACETS = ("Llama", "Qwen")
 BASELINE_GROUP_PREFIXES = ("stage1_llama8b_", "qwen_sys_3b_")
@@ -87,9 +91,23 @@ def _load_run_summary_for_selection() -> pd.DataFrame:
     return df_runs.copy()
 
 
+def _load_runs_with_slurm_metadata() -> pd.DataFrame:
+    df_runs, _ = load_view("runs")
+    required = ["run_id", "slurm_job_name"]
+    missing = [col for col in required if col not in df_runs.columns]
+    if missing:
+        raise ValueError(
+            "runs is missing required slurm metadata columns "
+            f"{missing}. Available columns: {list(df_runs.columns)}"
+        )
+    return df_runs[required].copy()
+
+
 def main() -> None:
     phase_df = _load_phase_fact_for_plot()
     runs_df = _load_run_summary_for_selection()
+    runs_meta_df = _load_runs_with_slurm_metadata()
+    runs_df = runs_df.merge(runs_meta_df, on="run_id", how="left", validate="one_to_one")
 
     runs_df["policy_norm"] = runs_df["policy"].astype(str).str.lower()
     runs_df["model_facet"] = runs_df["model"].map(_model_facet)
@@ -98,13 +116,17 @@ def main() -> None:
     baseline_label_mask = logical_group.str.startswith(BASELINE_GROUP_PREFIXES, na=False)
     non_rollout_knob_mask = ~logical_group.str.contains(r"rollout|knob|cap", na=False)
     target_pair_mask = runs_df["policy_norm"].isin(TARGET_POLICIES) & runs_df["model_facet"].isin(TARGET_MODEL_FACETS)
+    expected_slurm_job_name = runs_df["model_facet"].map(TARGET_SLURM_JOB_NAME_BY_FACET).astype(str).str.lower()
+    slurm_job_mask = runs_df["slurm_job_name"].astype(str).str.lower() == expected_slurm_job_name
     checkpoint_mask = (
         ~runs_df["is_checkpoint_continuation"].fillna(False).astype(bool)
         if "is_checkpoint_continuation" in runs_df.columns
         else True
     )
 
-    selected_runs = runs_df[baseline_label_mask & non_rollout_knob_mask & target_pair_mask & checkpoint_mask].copy()
+    selected_runs = runs_df[
+        baseline_label_mask & non_rollout_knob_mask & target_pair_mask & checkpoint_mask & slurm_job_mask
+    ].copy()
     if selected_runs.empty:
         raise ValueError("No baseline runs selected.")
 
@@ -147,6 +169,25 @@ def main() -> None:
     )
     print("points plotted by (model, phase_bucket, policy):")
     print(point_counts.to_string(index=False))
+
+    phase_means = (
+        plot_df.groupby(["phase_bucket", "model_facet"], dropna=False)["avg_power_w"]
+        .mean()
+        .unstack("model_facet")
+        .reindex(PHASE_ORDER)
+    )
+    phase_pct_diff = ((phase_means.get("Qwen") - phase_means.get("Llama")) / phase_means.get("Llama")) * 100.0
+    print("phase mean avg_power_w and %diff ((Qwen-Llama)/Llama*100):")
+    print(
+        pd.DataFrame(
+            {
+                "phase_bucket": PHASE_ORDER,
+                "llama_mean_power_w": phase_means.get("Llama"),
+                "qwen_mean_power_w": phase_means.get("Qwen"),
+                "pct_diff_qwen_vs_llama": phase_pct_diff,
+            }
+        ).to_string(index=False)
+    )
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
     facet_axes = dict(zip(TARGET_MODEL_FACETS, axes))
@@ -202,6 +243,16 @@ def main() -> None:
         ax.set_xlabel("phase_name")
         ax.set_title(facet)
         ax.grid(axis="y", alpha=0.2)
+
+    y_min, y_max = axes[0].get_ylim()
+    y_span = max(y_max - y_min, 1e-9)
+    for ax in axes:
+        ax.set_ylim(y_min, y_max + 0.12 * y_span)
+    annot_y = y_max + 0.08 * y_span
+    for phase_i, phase in enumerate(PHASE_ORDER, start=1):
+        pct = phase_pct_diff.get(phase)
+        label = f"Qwen vs Llama: {pct:+.1f}%" if pd.notna(pct) else "Qwen vs Llama: n/a"
+        axes[0].text(phase_i, annot_y, label, ha="center", va="bottom", fontsize=8, fontweight="bold")
 
     axes[0].set_ylabel("avg_power_w")
     fig.suptitle("avg_power_w by phase_name (baseline runs)", y=0.99)
