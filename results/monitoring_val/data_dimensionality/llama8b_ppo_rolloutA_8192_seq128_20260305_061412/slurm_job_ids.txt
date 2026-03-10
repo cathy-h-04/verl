@@ -1,0 +1,4 @@
+timestamp: 20260305_070446
+slurm_job_id: 64028382
+slurm_array_task_id: 1
+slurm_job_name: llama_rollout_ab

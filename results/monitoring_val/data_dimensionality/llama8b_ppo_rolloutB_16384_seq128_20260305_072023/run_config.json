@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_rollout_ab/runs.json",
+    "index": 2,
+    "name": "llama8b_ppo_rolloutB_16384_seq128"
+  },
+  "run": {
+    "val_max_samples": 128,
+    "gpus_per_node": 4,
+    "use_validation": true,
+    "rollout_n": 1,
+    "save_freq": -1,
+    "total_epochs": 1,
+    "policy": "ppo",
+    "resume_path": null,
+    "val_freq": 10,
+    "dataset": "gsm8k",
+    "total_steps": null,
+    "granularity": "operation",
+    "nnodes": 1,
+    "poll_interval": 0.5,
+    "name": "llama8b_ppo_rolloutB_16384_seq128",
+    "model": "meta-llama/Llama-3.1-8B-Instruct"
+  },
+  "train": {
+    "log_prob_micro_batch_size": 4,
+    "gpu_memory_util": 0.5,
+    "train_batch_size": 128,
+    "ppo_mini_batch_size": 32,
+    "enable_grad_checkpointing": true,
+    "micro_batch_size_per_gpu": 4,
+    "tensor_parallel_size": 1,
+    "rollout_max_model_len": 2048,
+    "rollout_max_batched_tokens": 16384,
+    "rollout_max_num_seqs": 128,
+    "enable_chunked_prefill": false
+  }
+}
