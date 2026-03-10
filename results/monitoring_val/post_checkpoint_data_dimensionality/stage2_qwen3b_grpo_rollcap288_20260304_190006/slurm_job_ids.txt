@@ -1,0 +1,4 @@
+timestamp: 20260304_191344
+slurm_job_id: 63685555
+slurm_array_task_id: 3
+slurm_job_name: stage2_qwen_cap

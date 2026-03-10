@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/stage2_small_microbatch/runs.json",
+    "index": 3,
+    "name": "stage2_smallmb_qwen3b_grpo"
+  },
+  "run": {
+    "val_freq": 10,
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "use_validation": true,
+    "total_epochs": 1,
+    "poll_interval": 0.5,
+    "granularity": "operation",
+    "resume_path": "/n/netscratch/yu_lab/Lab/chou/checkpoints/qwen_sys_3b_grpo_20260226_113138/global_step_50",
+    "save_freq": -1,
+    "name": "stage2_smallmb_qwen3b_grpo",
+    "rollout_n": 2,
+    "total_steps": null,
+    "policy": "grpo",
+    "gpus_per_node": 4,
+    "dataset": "gsm8k",
+    "val_max_samples": 128,
+    "nnodes": 1
+  },
+  "train": {
+    "rollout_max_model_len": 2048,
+    "enable_grad_checkpointing": true,
+    "rollout_max_num_seqs": 64,
+    "gpu_memory_util": 0.5,
+    "micro_batch_size_per_gpu": 2,
+    "tensor_parallel_size": 1,
+    "train_batch_size": 128,
+    "ppo_mini_batch_size": 32,
+    "rollout_max_batched_tokens": 8192,
+    "log_prob_micro_batch_size": 4
+  }
+}

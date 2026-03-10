@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/stage2_small_microbatch/runs.json",
+    "index": 6,
+    "name": "stage2_smallmb_llama8b_grpo"
+  },
+  "run": {
+    "name": "stage2_smallmb_llama8b_grpo",
+    "resume_path": "/n/netscratch/yu_lab/Lab/chou/checkpoints/stage1_llama8b_grpo_20260226_192746/global_step_50",
+    "granularity": "operation",
+    "val_freq": 10,
+    "save_freq": -1,
+    "nnodes": 1,
+    "total_epochs": 1,
+    "poll_interval": 0.5,
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "use_validation": true,
+    "gpus_per_node": 4,
+    "total_steps": null,
+    "val_max_samples": 128,
+    "rollout_n": 2,
+    "policy": "grpo",
+    "dataset": "gsm8k"
+  },
+  "train": {
+    "enable_grad_checkpointing": true,
+    "gpu_memory_util": 0.5,
+    "rollout_max_batched_tokens": 8192,
+    "rollout_max_num_seqs": 64,
+    "tensor_parallel_size": 1,
+    "rollout_max_model_len": 2048,
+    "log_prob_micro_batch_size": 4,
+    "train_batch_size": 128,
+    "micro_batch_size_per_gpu": 2,
+    "ppo_mini_batch_size": 32
+  }
+}

@@ -1,0 +1,4 @@
+timestamp: 20260304_171628
+slurm_job_id: 63891122
+slurm_array_task_id: 5
+slurm_job_name: stage2_small_microbatch

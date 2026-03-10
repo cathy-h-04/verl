@@ -1,0 +1,4 @@
+timestamp: 20260304_175647
+slurm_job_id: 63898584
+slurm_array_task_id: 1
+slurm_job_name: stage2_llama_cap

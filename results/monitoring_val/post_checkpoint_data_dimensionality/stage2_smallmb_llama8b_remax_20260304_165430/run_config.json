@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/stage2_small_microbatch/runs.json",
+    "index": 5,
+    "name": "stage2_smallmb_llama8b_remax"
+  },
+  "run": {
+    "total_epochs": 1,
+    "dataset": "gsm8k",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "poll_interval": 0.5,
+    "use_validation": true,
+    "total_steps": null,
+    "save_freq": -1,
+    "gpus_per_node": 4,
+    "val_max_samples": 128,
+    "policy": "remax",
+    "rollout_n": 1,
+    "name": "stage2_smallmb_llama8b_remax",
+    "resume_path": "/n/netscratch/yu_lab/Lab/chou/checkpoints/stage1_llama8b_remax_20260226_173013/global_step_50",
+    "granularity": "operation",
+    "nnodes": 1,
+    "val_freq": 10
+  },
+  "train": {
+    "rollout_max_num_seqs": 64,
+    "train_batch_size": 128,
+    "ppo_mini_batch_size": 32,
+    "rollout_max_batched_tokens": 8192,
+    "micro_batch_size_per_gpu": 2,
+    "gpu_memory_util": 0.5,
+    "enable_grad_checkpointing": true,
+    "rollout_max_model_len": 2048,
+    "log_prob_micro_batch_size": 4,
+    "tensor_parallel_size": 1
+  }
+}
