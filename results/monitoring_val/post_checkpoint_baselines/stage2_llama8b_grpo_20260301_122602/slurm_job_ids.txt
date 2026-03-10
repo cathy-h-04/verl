@@ -1,0 +1,4 @@
+timestamp: 20260301_123547
+slurm_job_id: 63031634
+slurm_array_task_id: 3
+slurm_job_name: stage2_llama_check

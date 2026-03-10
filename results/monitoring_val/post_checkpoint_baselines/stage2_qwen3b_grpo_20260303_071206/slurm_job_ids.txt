@@ -1,0 +1,4 @@
+timestamp: 20260303_072038
+slurm_job_id: 63105296
+slurm_array_task_id: 3
+slurm_job_name: stage2_qwen_check

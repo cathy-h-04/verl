@@ -1,0 +1,37 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/stage2_qwen3b/runs.json",
+    "index": 2,
+    "name": "stage2_qwen3b_remax"
+  },
+  "run": {
+    "total_steps": null,
+    "val_freq": 10,
+    "nnodes": 1,
+    "gpus_per_node": 4,
+    "policy": "remax",
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "dataset": "gsm8k",
+    "val_max_samples": 128,
+    "save_freq": -1,
+    "resume_path": "/n/netscratch/yu_lab/Lab/chou/checkpoints/qwen_sys_3b_remax_20260226_103618/global_step_50",
+    "rollout_n": 1,
+    "total_epochs": 1,
+    "poll_interval": 0.5,
+    "use_validation": true,
+    "name": "stage2_qwen3b_remax",
+    "granularity": "operation"
+  },
+  "train": {
+    "gpu_memory_util": 0.5,
+    "micro_batch_size_per_gpu": 4,
+    "log_prob_micro_batch_size": 4,
+    "rollout_max_batched_tokens": 8192,
+    "rollout_max_num_seqs": 64,
+    "enable_grad_checkpointing": true,
+    "rollout_max_model_len": 2048,
+    "ppo_mini_batch_size": 32,
+    "train_batch_size": 128,
+    "tensor_parallel_size": 1
+  }
+}
