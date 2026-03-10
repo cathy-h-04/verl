@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_4gpu_a100/runs.json",
+    "index": 3,
+    "name": "stage1_llama8b_grpo_4gpu_a100"
+  },
+  "run": {
+    "use_validation": true,
+    "total_steps": null,
+    "rollout_n": 2,
+    "policy": "grpo",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "granularity": "operation",
+    "total_epochs": 1,
+    "val_max_samples": 128,
+    "gpus_per_node": 4,
+    "dataset": "gsm8k",
+    "poll_interval": 0.5,
+    "val_freq": 10,
+    "save_freq": -1,
+    "name": "stage1_llama8b_grpo_4gpu_a100",
+    "resume_path": null,
+    "nnodes": 1
+  },
+  "train": {
+    "rollout_max_model_len": 2048,
+    "log_prob_micro_batch_size": 4,
+    "enable_grad_checkpointing": true,
+    "ppo_mini_batch_size": 32,
+    "rollout_max_batched_tokens": 4096,
+    "tensor_parallel_size": 1,
+    "gpu_memory_util": 0.4,
+    "rollout_max_num_seqs": 32,
+    "micro_batch_size_per_gpu": 4,
+    "train_batch_size": 128,
+    "enable_chunked_prefill": false
+  }
+}
