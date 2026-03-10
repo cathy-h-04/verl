@@ -1,0 +1,4 @@
+timestamp: 20260301_103226
+slurm_job_id: 63051667
+slurm_array_task_id: 2
+slurm_job_name: qwen_new_baseline
