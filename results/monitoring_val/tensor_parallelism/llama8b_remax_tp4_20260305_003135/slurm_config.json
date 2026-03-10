@@ -1,0 +1,12 @@
+{
+  "job_name": "llama_tp4",
+  "partition": "gpu_h200",
+  "time": "01:20:00",
+  "nodes": 1,
+  "ntasks_per_node": 1,
+  "gpus_per_node": 4,
+  "cpus_per_task": 16,
+  "mem": "48G",
+  "output": "/n/netscratch/yu_lab/Lab/chou/logs/%A_%a.out",
+  "error": "/n/netscratch/yu_lab/Lab/chou/logs/%A_%a.err"
+}

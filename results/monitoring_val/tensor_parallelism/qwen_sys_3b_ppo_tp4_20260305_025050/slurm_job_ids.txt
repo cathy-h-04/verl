@@ -1,0 +1,4 @@
+timestamp: 20260305_033540
+slurm_job_id: 63999003
+slurm_array_task_id: 1
+slurm_job_name: qwen_tp4

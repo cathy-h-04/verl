@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_tp4/runs.json",
+    "index": 2,
+    "name": "llama8b_remax_tp4"
+  },
+  "run": {
+    "granularity": "operation",
+    "resume_path": null,
+    "val_max_samples": 128,
+    "nnodes": 1,
+    "dataset": "gsm8k",
+    "total_epochs": 1,
+    "policy": "remax",
+    "val_freq": 10,
+    "poll_interval": 0.5,
+    "name": "llama8b_remax_tp4",
+    "gpus_per_node": 4,
+    "rollout_n": 1,
+    "save_freq": -1,
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "total_steps": null,
+    "use_validation": true
+  },
+  "train": {
+    "gpu_memory_util": 0.5,
+    "log_prob_micro_batch_size": 4,
+    "enable_grad_checkpointing": true,
+    "rollout_max_model_len": 2048,
+    "rollout_max_batched_tokens": 8192,
+    "micro_batch_size_per_gpu": 4,
+    "ppo_mini_batch_size": 32,
+    "train_batch_size": 128,
+    "tensor_parallel_size": 4,
+    "rollout_max_num_seqs": 64,
+    "enable_chunked_prefill": false
+  }
+}

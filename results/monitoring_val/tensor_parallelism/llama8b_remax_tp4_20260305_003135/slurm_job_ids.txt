@@ -1,0 +1,4 @@
+timestamp: 20260305_012702
+slurm_job_id: 63975795
+slurm_array_task_id: 2
+slurm_job_name: llama_tp4
