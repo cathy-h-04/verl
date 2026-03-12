@@ -1,0 +1,4 @@
+timestamp: 20260311_043324
+slurm_job_id: 65381789
+slurm_array_task_id: 1
+slurm_job_name: llama_rm_gsm8k

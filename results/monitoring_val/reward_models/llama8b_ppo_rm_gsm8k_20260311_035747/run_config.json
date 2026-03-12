@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_rm_gsm8k/runs.json",
+    "index": 1,
+    "name": "llama8b_ppo_rm_gsm8k"
+  },
+  "run": {
+    "gpus_per_node": 4,
+    "resume_path": null,
+    "dataset": "gsm8k",
+    "val_max_samples": 128,
+    "granularity": "operation",
+    "total_epochs": 1,
+    "name": "llama8b_ppo_rm_gsm8k",
+    "nnodes": 1,
+    "rollout_n": 1,
+    "save_freq": -1,
+    "val_freq": 10,
+    "policy": "ppo",
+    "total_steps": null,
+    "use_validation": true,
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "poll_interval": 0.5
+  },
+  "train": {
+    "train_batch_size": 128,
+    "reward_model_micro_batch_size_per_gpu": 16,
+    "rollout_max_batched_tokens": 8192,
+    "enable_grad_checkpointing": true,
+    "ppo_mini_batch_size": 32,
+    "tensor_parallel_size": 1,
+    "gpu_memory_util": 0.5,
+    "rollout_max_num_seqs": 64,
+    "micro_batch_size_per_gpu": 4,
+    "reward_model_enable": true,
+    "log_prob_micro_batch_size": 4,
+    "reward_model_name": "sfairXC/FsfairX-LLaMA3-RM-v0.1",
+    "rollout_max_model_len": 2048,
+    "enable_chunked_prefill": false
+  }
+}
