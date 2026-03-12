@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_4gpu_h200/runs.json",
+    "index": 2,
+    "name": "llama8b_remax_4gpu_h200"
+  },
+  "run": {
+    "resume_path": null,
+    "val_max_samples": 128,
+    "poll_interval": 0.5,
+    "nnodes": 1,
+    "granularity": "operation",
+    "name": "llama8b_remax_4gpu_h200",
+    "use_validation": true,
+    "save_freq": -1,
+    "rollout_n": 1,
+    "dataset": "gsm8k",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "policy": "remax",
+    "val_freq": 10,
+    "total_epochs": 1,
+    "gpus_per_node": 4,
+    "total_steps": null
+  },
+  "train": {
+    "rollout_max_model_len": 2048,
+    "rollout_max_num_seqs": 32,
+    "enable_grad_checkpointing": true,
+    "tensor_parallel_size": 1,
+    "micro_batch_size_per_gpu": 4,
+    "gpu_memory_util": 0.4,
+    "rollout_max_batched_tokens": 4096,
+    "ppo_mini_batch_size": 32,
+    "log_prob_micro_batch_size": 4,
+    "train_batch_size": 128,
+    "enable_chunked_prefill": false
+  }
+}

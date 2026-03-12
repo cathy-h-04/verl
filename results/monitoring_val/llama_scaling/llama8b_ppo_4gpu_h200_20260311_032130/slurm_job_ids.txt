@@ -1,0 +1,4 @@
+timestamp: 20260311_035708
+slurm_job_id: 65378259
+slurm_array_task_id: 1
+slurm_job_name: llama_4gpu_h200
