@@ -1,6 +1,7 @@
 # Experiment Dataset Builder
 
 This directory contains a standalone dataset ingestion script for experiment artifacts under `results/`.
+It does not change where raw experiments write outputs; it only controls what gets ingested into Parquet datasets.
 
 ## Script
 
@@ -42,6 +43,7 @@ Output files:
 ## Ingestion Rules
 
 - Run discovery scans recursively under `--results-root` for folders containing `experiment_name.txt`.
+- Optional filtering: provide one or more `--include-subdir` paths to ingest only runs inside those subtrees.
 - Required run files are validated, including dynamic files:
   - `[EXP_NAME].jsonl`
   - `[EXP_NAME]_config.json`
@@ -108,9 +110,23 @@ python analysis_scripts/build_run_datasets.py \
   --overwrite
 ```
 
+Selective ingestion example:
+
+```bash
+python analysis_scripts/build_run_datasets.py \
+  --results-root /n/home08/chou/verl_research/results/monitoring_val \
+  --include-subdir /n/home08/chou/verl_research/results/monitoring_val/llama_baselines \
+  --include-subdir /n/home08/chou/verl_research/results/monitoring_val/qwen_baselines \
+  --include-subdir /n/home08/chou/verl_research/results/monitoring_val/llama_scaling \
+  --output-root /n/home08/chou/verl_research/DATASETS \
+  --workers 1 \
+  --overwrite
+```
+
 Arguments:
 
 - `--results-root`: input root (default `/n/home08/chou/verl_research/results`)
+- `--include-subdir`: optional include scope; repeat to include multiple directories (absolute or relative to `--results-root`)
 - `--output-root`: output directory (default `/n/home08/chou/verl_research/DATASETS`)
 - `--workers`: reserved for future parallel parsing (currently single-process)
 - `--overwrite`: remove existing output directory before writing

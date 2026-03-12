@@ -148,6 +148,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory where output Parquet tables will be written.",
     )
     parser.add_argument(
+        "--include-subdir",
+        action="append",
+        default=None,
+        help=(
+            "Optional subdirectory under --results-root to include. "
+            "Repeat this flag to include multiple subtrees. "
+            "Accepts absolute paths or paths relative to --results-root."
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -161,12 +171,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> None:
+def _resolve_include_subdirs(results_root: Path, include_subdirs: Optional[List[str]]) -> List[Path]:
+    if not include_subdirs:
+        return []
+
+    resolved_paths: List[Path] = []
+    for raw_path in include_subdirs:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = results_root / candidate
+        candidate = candidate.resolve()
+
+        if not candidate.exists() or not candidate.is_dir():
+            raise ValueError(f"--include-subdir path does not exist or is not a directory: {candidate}")
+
+        try:
+            candidate.relative_to(results_root)
+        except ValueError as e:
+            raise ValueError(
+                f"--include-subdir path must be within --results-root ({results_root}): {candidate}"
+            ) from e
+
+        resolved_paths.append(candidate)
+
+    return sorted(set(resolved_paths))
+
+
+def build_datasets(results_root: Path, output_root: Path, overwrite: bool, include_dirs: Optional[List[Path]] = None) -> None:
     if overwrite and output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    run_dirs = _discover_run_dirs(results_root)
+    run_dirs = _discover_run_dirs(results_root, include_dirs=include_dirs)
 
     runs_rows: List[Dict[str, Any]] = []
     lineage_rows: List[Dict[str, Any]] = []
@@ -1145,6 +1181,10 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool) -> No
 
     print("Dataset build complete")
     print(f"  Results root: {results_root}")
+    if include_dirs:
+        print(f"  Included subdirs: {len(include_dirs)}")
+        for include_dir in include_dirs:
+            print(f"    - {include_dir}")
     print(f"  Output root:  {output_root}")
     print(f"  Included runs: {included_runs}")
     print(f"  Excluded runs: {excluded_runs}")
@@ -1168,7 +1208,14 @@ def main() -> None:
     if args.workers < 1:
         raise ValueError("--workers must be >= 1")
 
-    build_datasets(results_root=results_root, output_root=output_root, overwrite=args.overwrite)
+    include_dirs = _resolve_include_subdirs(results_root=results_root, include_subdirs=args.include_subdir)
+
+    build_datasets(
+        results_root=results_root,
+        output_root=output_root,
+        overwrite=args.overwrite,
+        include_dirs=include_dirs,
+    )
 
 
 if __name__ == "__main__":

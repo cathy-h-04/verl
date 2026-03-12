@@ -108,6 +108,21 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_bool(x: Any) -> Optional[bool]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    s = str(x).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip()
 
@@ -153,9 +168,18 @@ def _parse_slurm_job_ids(path: Path) -> Dict[str, Any]:
     return out
 
 
-def _discover_run_dirs(results_root: Path) -> List[Path]:
-    run_dirs = sorted({p.parent for p in results_root.rglob("experiment_name.txt")})
-    return [p for p in run_dirs if p.is_dir()]
+def _discover_run_dirs(results_root: Path, include_dirs: Optional[Iterable[Path]] = None) -> List[Path]:
+    search_roots = [results_root] if not include_dirs else list(include_dirs)
+
+    run_dirs = set()
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        if (root / "experiment_name.txt").exists():
+            run_dirs.add(root)
+        run_dirs.update(p.parent for p in root.rglob("experiment_name.txt"))
+
+    return sorted(p for p in run_dirs if p.is_dir())
 
 
 def _required_files_for_run(run_id: str, required_static_files: Iterable[str]) -> List[str]:
@@ -634,6 +658,7 @@ def _build_analysis_views(
     run_identity["variant_tags"] = run_identity["run_name"].fillna(run_identity["logical_run_group"])
 
     rollout_max_batched_tokens_vals: List[Optional[float]] = []
+    enable_chunked_prefill_vals: List[Optional[bool]] = []
     for cfg in run_identity["run_config_json"].tolist():
         cfg_obj = _parse_json_map(cfg)
         val = _recursive_find_first(
@@ -645,7 +670,11 @@ def _build_analysis_views(
             ),
         )
         rollout_max_batched_tokens_vals.append(_safe_float(val))
+        enable_chunked_prefill_vals.append(
+            _safe_bool(_recursive_find_first(cfg_obj, keys=("enable_chunked_prefill", "rollout_enable_chunked_prefill")))
+        )
     run_identity["rollout_max_batched_tokens"] = rollout_max_batched_tokens_vals
+    run_identity["enable_chunked_prefill"] = enable_chunked_prefill_vals
 
     check_cols = [
         "run_id",
@@ -766,6 +795,20 @@ def _build_analysis_views(
             phase_fact_view.get("shape_thr_hw_power_brake_frac_twa"), errors="coerce"
         )
 
+        # Step-level perf memory metrics are broadcast to each phase row for that run-step.
+        phase_perf_cols = ["run_id", "global_step_canonical", "metric_perf_max_memory_allocated_gb"]
+        phase_perf_df = _ensure_columns(wide_df.copy(), phase_perf_cols)[phase_perf_cols].rename(
+            columns={"metric_perf_max_memory_allocated_gb": "max_memory_allocated_gb"}
+        )
+        phase_perf_df["max_memory_allocated_gb"] = pd.to_numeric(
+            phase_perf_df["max_memory_allocated_gb"], errors="coerce"
+        )
+        phase_fact_view = phase_fact_view.merge(
+            phase_perf_df,
+            on=["run_id", "global_step_canonical"],
+            how="left",
+        )
+
         step_group = ["run_id", "global_step_canonical"]
         step_energy_sum = phase_fact_view.groupby(step_group, dropna=False)["total_energy_j"].transform("sum")
         step_time_sum = phase_fact_view.groupby(step_group, dropna=False)["phase_time_s"].transform("sum")
@@ -807,6 +850,7 @@ def _build_analysis_views(
             "time_share",
             "power_density_index",
             "avg_power_w",
+            "max_memory_allocated_gb",
             "gpu_util_mean",
             "sm_util_mean",
             "mem_util_mean",
@@ -871,6 +915,7 @@ def _build_analysis_views(
             "validation_logged",
             "metric_perf_throughput",
             "metric_perf_mfu_actor",
+            "metric_perf_max_memory_allocated_gb",
             "metric_rollout_straggler_ratio",
             "metric_rollout_sync_efficiency",
         ]
@@ -879,11 +924,12 @@ def _build_analysis_views(
             columns={
                 "metric_perf_throughput": "throughput_tokens_s",
                 "metric_perf_mfu_actor": "mfu_actor",
+                "metric_perf_max_memory_allocated_gb": "max_memory_allocated_gb",
                 "metric_rollout_straggler_ratio": "straggler_ratio",
                 "metric_rollout_sync_efficiency": "sync_efficiency",
             }
         )
-        for col in ["throughput_tokens_s", "mfu_actor", "straggler_ratio", "sync_efficiency"]:
+        for col in ["throughput_tokens_s", "mfu_actor", "max_memory_allocated_gb", "straggler_ratio", "sync_efficiency"]:
             perf_df[col] = pd.to_numeric(perf_df[col], errors="coerce")
 
         step_fact_view = step_fact_view.merge(
@@ -937,6 +983,7 @@ def _build_analysis_views(
             "step_train_tokens_est",
             "throughput_tokens_s",
             "mfu_actor",
+            "max_memory_allocated_gb",
             "straggler_ratio",
             "sync_efficiency",
             "step_j_per_output_token",
@@ -966,6 +1013,7 @@ def _build_analysis_views(
                 "experiment_variant",
                 "variant_tags",
                 "rollout_max_batched_tokens",
+                "enable_chunked_prefill",
                 "is_checkpoint_continuation",
                 "slurm_partition",
                 "slurm_nodes",
@@ -1085,6 +1133,7 @@ def _build_analysis_views(
                 "model",
                 "experiment_variant",
                 "rollout_max_batched_tokens",
+                "enable_chunked_prefill",
                 "is_checkpoint_continuation",
             ]
         ].drop_duplicates("run_id")
@@ -1094,6 +1143,7 @@ def _build_analysis_views(
             "model",
             "experiment_variant",
             "rollout_max_batched_tokens",
+            "enable_chunked_prefill",
             "is_checkpoint_continuation",
         ]
         comparison_view = (
