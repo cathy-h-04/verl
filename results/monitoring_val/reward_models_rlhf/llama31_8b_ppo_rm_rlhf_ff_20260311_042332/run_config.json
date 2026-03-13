@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "source": "/n/home08/chou/verl_research/profiling_scripts/experiments/llama_rm_rlhf/runs.json",
+    "index": 1,
+    "name": "llama31_8b_ppo_rm_rlhf_ff"
+  },
+  "run": {
+    "use_validation": true,
+    "gpus_per_node": 4,
+    "resume_path": null,
+    "name": "llama31_8b_ppo_rm_rlhf_ff",
+    "nnodes": 1,
+    "total_steps": 58,
+    "poll_interval": 0.5,
+    "val_max_samples": 128,
+    "rollout_n": 1,
+    "granularity": "operation",
+    "dataset": "rlhf-ff",
+    "policy": "ppo",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "total_epochs": 1,
+    "val_freq": 10,
+    "save_freq": -1
+  },
+  "train": {
+    "ppo_mini_batch_size": 32,
+    "log_prob_micro_batch_size": 4,
+    "gpu_memory_util": 0.5,
+    "tensor_parallel_size": 1,
+    "reward_model_name": "sfairXC/FsfairX-LLaMA3-RM-v0.1",
+    "enable_grad_checkpointing": true,
+    "train_batch_size": 128,
+    "reward_model_enable": true,
+    "rollout_max_model_len": 2048,
+    "rollout_max_batched_tokens": 8192,
+    "micro_batch_size_per_gpu": 4,
+    "rollout_max_num_seqs": 64,
+    "reward_model_micro_batch_size_per_gpu": 16,
+    "enable_chunked_prefill": false
+  }
+}
