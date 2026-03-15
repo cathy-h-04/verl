@@ -1,0 +1,4 @@
+timestamp: 20260315_191938
+slurm_job_id: 66189584
+slurm_array_task_id: 2
+slurm_job_name: llama_2gpu_a100
