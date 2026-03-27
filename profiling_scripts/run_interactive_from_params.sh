@@ -136,10 +136,18 @@ else
 fi
 export MOVE_CHECKPOINTS
 
+POLICY_NORMALIZED="$(echo "${POLICY:-ppo}" | tr '[:upper:]' '[:lower:]')"
 TRAIN_SCRIPT="run_verl_train_nonval.sh"
+if [ "$POLICY_NORMALIZED" = "sft" ]; then
+    TRAIN_SCRIPT="run_verl_train_sft_nonval.sh"
+fi
 case "${USE_VALIDATION:-}" in
     1|true|TRUE|yes|YES)
-        TRAIN_SCRIPT="run_verl_train_val.sh"
+        if [ "$POLICY_NORMALIZED" = "sft" ]; then
+            TRAIN_SCRIPT="run_verl_train_sft_val.sh"
+        else
+            TRAIN_SCRIPT="run_verl_train_val.sh"
+        fi
         ;;
 esac
 export TRAIN_SCRIPT

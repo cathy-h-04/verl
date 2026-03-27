@@ -119,12 +119,14 @@ def build_step_index_and_checks(
 def build_boundary_integrity_outputs(
     run_id: str,
     run_boundary_rows_local: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, int, int]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, int, int, bool, int]:
     """Build phase-instance timestamps and boundary pair integrity rows."""
     if not run_boundary_rows_local:
-        return [], [], 1.0, 0, 0
+        return [], [], 1.0, 0, 0, False, 0
 
     run_boundary_df = pd.DataFrame(run_boundary_rows_local)
+    step_series = pd.to_numeric(run_boundary_df.get("global_step_canonical"), errors="coerce")
+    max_step = int(step_series.max()) if not step_series.dropna().empty else None
 
     phase_rows_local: List[Dict[str, Any]] = []
     for (phase_instance_id, phase_name, phase_id, step_val), grp in run_boundary_df.groupby(
@@ -157,12 +159,23 @@ def build_boundary_integrity_outputs(
         )
 
     pair_rows_local: List[Dict[str, Any]] = []
+    invalid_terminal_start_only_count = 0
+    invalid_pair_count = 0
     for (pair_key, phase_instance_id, source, device_id), grp in run_boundary_df.groupby(
         ["boundary_pair_key", "phase_instance_id", "source", "device_id"], dropna=False
     ):
         start_count = int((grp.get("phase_event") == "START").sum())
         end_count = int((grp.get("phase_event") == "END").sum())
         is_valid = start_count == 1 and end_count == 1
+        pair_step_series = pd.to_numeric(grp.get("global_step_canonical"), errors="coerce")
+        pair_step = int(pair_step_series.iloc[0]) if not pair_step_series.dropna().empty else None
+        is_terminal_start_only_pair = (
+            not is_valid and start_count == 1 and end_count == 0 and max_step is not None and pair_step == max_step
+        )
+        if not is_valid:
+            invalid_pair_count += 1
+            if is_terminal_start_only_pair:
+                invalid_terminal_start_only_count += 1
         pair_rows_local.append(
             {
                 "run_id": run_id,
@@ -170,10 +183,12 @@ def build_boundary_integrity_outputs(
                 "phase_instance_id": phase_instance_id,
                 "source": source,
                 "device_id": device_id,
+                "global_step_canonical": pair_step,
                 "start_count": start_count,
                 "end_count": end_count,
                 "row_count": int(len(grp)),
                 "is_valid_pair": bool(is_valid),
+                "is_terminal_start_only_pair": bool(is_terminal_start_only_pair),
             }
         )
 
@@ -182,8 +197,17 @@ def build_boundary_integrity_outputs(
     boundary_pair_integrity = (
         boundary_pair_valid / float(boundary_pair_total) if boundary_pair_total else 1.0
     )
+    terminal_start_only_exception = invalid_pair_count > 0 and invalid_pair_count == invalid_terminal_start_only_count
 
-    return phase_rows_local, pair_rows_local, boundary_pair_integrity, boundary_pair_total, boundary_pair_valid
+    return (
+        phase_rows_local,
+        pair_rows_local,
+        boundary_pair_integrity,
+        boundary_pair_total,
+        boundary_pair_valid,
+        terminal_start_only_exception,
+        invalid_terminal_start_only_count,
+    )
 
 
 def validate_ingestion_checks(ingestion_checks_df: pd.DataFrame) -> Tuple[int, float]:
@@ -209,12 +233,18 @@ def validate_ingestion_checks(ingestion_checks_df: pd.DataFrame) -> Tuple[int, f
         else 1.0
     )
     if min_boundary_pair_integrity < 1.0:
-        bad_integrity_runs = ingestion_checks_df[
-            pd.to_numeric(ingestion_checks_df.get("boundary_pair_integrity"), errors="coerce") < 1.0
-        ][["run_id", "boundary_pair_integrity", "boundary_pair_total", "boundary_pair_valid"]]
-        raise RuntimeError(
-            "Detected boundary pair integrity < 1.0; refusing to write datasets. "
-            f"Run-level boundary integrity failures: {bad_integrity_runs.to_dict(orient='records')}"
+        exception_mask = (
+            pd.Series(False, index=ingestion_checks_df.index)
+            if "terminal_start_only_boundary_exception" not in ingestion_checks_df.columns
+            else ingestion_checks_df["terminal_start_only_boundary_exception"].fillna(False).astype(bool)
         )
+        bad_integrity_runs = ingestion_checks_df[
+            (pd.to_numeric(ingestion_checks_df.get("boundary_pair_integrity"), errors="coerce") < 1.0) & ~exception_mask
+        ][["run_id", "boundary_pair_integrity", "boundary_pair_total", "boundary_pair_valid"]]
+        if not bad_integrity_runs.empty:
+            raise RuntimeError(
+                "Detected boundary pair integrity < 1.0; refusing to write datasets. "
+                f"Run-level boundary integrity failures: {bad_integrity_runs.to_dict(orient='records')}"
+            )
 
     return total_mismatch_count, min_boundary_pair_integrity

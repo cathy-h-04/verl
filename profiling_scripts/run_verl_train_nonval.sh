@@ -85,8 +85,13 @@ GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.50}"
 ROLLOUT_MAX_BATCHED_TOKENS="${ROLLOUT_MAX_BATCHED_TOKENS:-8192}"
 ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-2048}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-64}"
+ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-false}"
+ROLLOUT_QUANTIZATION="${ROLLOUT_QUANTIZATION:-}"
 ROLLOUT_N="${ROLLOUT_N:-4}"
 ENABLE_GRAD_CHECKPOINTING="${ENABLE_GRAD_CHECKPOINTING:-true}"
+RM_MODEL_NAME="${RM_MODEL_NAME:-sfairXC/FsfairX-LLaMA3-RM-v0.1}"
+RM_MICRO_BATCH_SIZE_PER_GPU="${RM_MICRO_BATCH_SIZE_PER_GPU:-16}"
+REWARD_MODEL_ENABLE_RAW="${REWARD_MODEL_ENABLE:-}"
 
 # -------------------- Environment Setup --------------------
 cd "$PROJECT_DIR"
@@ -120,6 +125,8 @@ mkdir -p "$MONITORING_DIR"
 # export VLLM_DISABLE_FLASHINFER=1  # uncomment if flashinfer causes issues
 
 # -------------------- Dataset Setup --------------------
+DATASET_ARGS=()
+RM_ARGS=()
 case "$DATASET_NAME" in
     gsm8k)
         DATA_DIR="${SCRATCH_DIR}/data/gsm8k"
@@ -127,11 +134,50 @@ case "$DATASET_NAME" in
         VAL_FILE="${DATA_DIR}/test.parquet"
         PREPROCESS_CMD="python3 examples/data_preprocess/gsm8k.py --local_save_dir \"$DATA_DIR\""
         ;;
+    rlhf-ff)
+        # RLHF full-hh-rlhf smoke path.
+        # RL split only contains train.parquet, so reuse it for val_file.
+        RLHF_ROOT="${SCRATCH_DIR}/data/full_hh_rlhf"
+        DATA_DIR="${RLHF_ROOT}/rl"
+        TRAIN_FILE="${DATA_DIR}/train.parquet"
+        VAL_FILE="${DATA_DIR}/train.parquet"
+        PREPROCESS_CMD="python3 examples/data_preprocess/full_hh_rlhf.py --split rl --local_save_dir \"$RLHF_ROOT\""
+        # full_hh_rlhf prompts can exceed 512 tokens.
+        DATASET_ARGS+=("data.max_prompt_length=1024")
+        DATASET_ARGS+=("data.truncation=right")
+        # For full_hh_rlhf, repo examples use model-based RM.
+        RM_ARGS+=("reward_model.enable=True")
+        RM_ARGS+=("reward_model.model.path=${RM_MODEL_NAME}")
+        RM_ARGS+=("reward_model.micro_batch_size_per_gpu=${RM_MICRO_BATCH_SIZE_PER_GPU}")
+        ;;
     *)
-        echo "ERROR: Unsupported dataset '$DATASET_NAME' (only gsm8k supported here)"
+        echo "ERROR: Unsupported dataset '$DATASET_NAME' (supported: gsm8k, rlhf-ff)"
         exit 1
         ;;
 esac
+
+# Optional config override to force-enable/disable model RM on any dataset.
+# Backward compatible: if REWARD_MODEL_ENABLE is unset, dataset defaults above are preserved.
+if [ -n "$REWARD_MODEL_ENABLE_RAW" ]; then
+    case "${REWARD_MODEL_ENABLE_RAW,,}" in
+        1|true|yes|y|on)
+            RM_ARGS=(
+                "reward_model.enable=True"
+                "reward_model.model.path=${RM_MODEL_NAME}"
+                "reward_model.micro_batch_size_per_gpu=${RM_MICRO_BATCH_SIZE_PER_GPU}"
+            )
+            echo "INFO: Enabling model RM via REWARD_MODEL_ENABLE override."
+            ;;
+        0|false|no|n|off)
+            RM_ARGS=()
+            echo "INFO: Disabling model RM via REWARD_MODEL_ENABLE override."
+            ;;
+        *)
+            echo "ERROR: Invalid REWARD_MODEL_ENABLE='$REWARD_MODEL_ENABLE_RAW' (expected true/false)."
+            exit 1
+            ;;
+    esac
+fi
 
 # -------------------- Directory Setup --------------------
 OUTPUT_DIR="${SCRATCH_DIR}/checkpoints/${EXPERIMENT_NAME}"
@@ -213,6 +259,14 @@ if [ -n "${RAY_ADDRESS:-}" ] && [ "${#RAY_INIT_ARGS[@]}" -eq 0 ]; then
     echo "FATAL: ray_kwargs.ray_init.num_cpus must be null when RAY_ADDRESS is set."
     exit 1
 fi
+ROLLOUT_QUANT_ARGS=()
+case "${ROLLOUT_QUANTIZATION,,}" in
+    ""|"none"|"null"|"default"|"off")
+        ;;
+    *)
+        ROLLOUT_QUANT_ARGS+=("+actor_rollout_ref.rollout.quantization=${ROLLOUT_QUANTIZATION}")
+        ;;
+esac
 
 
 python3 -m verl.trainer.main_ppo \
@@ -232,9 +286,10 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.mode=sync \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_BATCHED_TOKENS \
-  actor_rollout_ref.rollout.enable_chunked_prefill=False \
+  actor_rollout_ref.rollout.enable_chunked_prefill=$ROLLOUT_ENABLE_CHUNKED_PREFILL \
   actor_rollout_ref.rollout.max_model_len=$ROLLOUT_MAX_MODEL_LEN \
   actor_rollout_ref.rollout.max_num_seqs=$ROLLOUT_MAX_NUM_SEQS \
+  "${ROLLOUT_QUANT_ARGS[@]}" \
   actor_rollout_ref.rollout.n=$ROLLOUT_N \
   actor_rollout_ref.rollout.tensor_model_parallel_size=$TENSOR_PARALLEL_SIZE \
   actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTIL \
@@ -265,6 +320,8 @@ python3 -m verl.trainer.main_ppo \
   +critic.model.override_config.attn_implementation=flash_attention_2 \
   +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
   "${RESUME_ARGS[@]}" \
+  "${DATASET_ARGS[@]}" \
+  "${RM_ARGS[@]}" \
   "${POLICY_ARGS[@]}" \
   2>&1 | tee "$LOG_FILE"
 

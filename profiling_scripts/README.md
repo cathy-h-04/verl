@@ -25,6 +25,17 @@ Place experiment configs in a subfolder, e.g.:
 - `runs`: list of per-run overrides (put frequently changed fields here).
 - `defaults.run`: shared run-level defaults.
 - `defaults.train`: shared training defaults (rarely changed).
+- Optional run-level `power_cap_w`:
+  - `null` / omitted / `"default"` / `0`: no cap (use default GPU power limit)
+  - positive integer (for example `560`): applies `nvidia-smi -pl <watts>` at run start
+    and restores original limits during cleanup.
+- Optional train-level `rollout_quantization`:
+  - omitted / `null` / `"default"`: no rollout quantization override (backward compatible)
+  - `"fp8"`: sets `actor_rollout_ref.rollout.quantization=fp8` for vLLM rollout.
+- Optional train-level reward-model overrides (backward compatible):
+  - `reward_model_enable`: `true`/`false` to force-enable or disable model RM.
+  - `reward_model_name`: HF model id/path used when model RM is enabled.
+  - `reward_model_micro_batch_size_per_gpu`: RM scoring micro-batch size per GPU.
 
 Example:
 ```json
@@ -34,7 +45,9 @@ Example:
       "name": "gsm8k_val_profile",
       "model": "Qwen/Qwen2.5-7B-Instruct",
       "total_steps": null,
-      "save_freq": null
+      "save_freq": null,
+      "power_cap_w": null,
+      "rollout_quantization": null
     }
   ],
   "defaults": {
@@ -89,6 +102,10 @@ Resolved configs are written alongside monitoring outputs:
   - Training without validation (fast profiling).
 - `run_verl_train_val.sh`
   - Training with validation.
+- `run_verl_train_sft_nonval.sh`
+  - SFT training without validation.
+- `run_verl_train_sft_val.sh`
+  - SFT training with validation.
 - `monitor_nvidia_smi_phased.sh`
   - Legacy GPU monitoring + phase annotations (not used by default launcher path).
 - `verl_subphase_profiler.py`

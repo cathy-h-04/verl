@@ -22,6 +22,7 @@ RUN_KEYS = {
     "val_max_samples",
     "total_steps",
     "save_freq",
+    "power_cap_w",
     "resume_path",
     "rollout_n",
 }
@@ -36,7 +37,12 @@ TRAIN_KEYS = {
     "rollout_max_batched_tokens",
     "rollout_max_model_len",
     "rollout_max_num_seqs",
+    "enable_chunked_prefill",
+    "rollout_quantization",
     "enable_grad_checkpointing",
+    "reward_model_enable",
+    "reward_model_name",
+    "reward_model_micro_batch_size_per_gpu",
 }
 
 ENV_MAP_RUN = {
@@ -54,6 +60,7 @@ ENV_MAP_RUN = {
     "val_max_samples": "VAL_MAX_SAMPLES",
     "total_steps": "TOTAL_STEPS",
     "save_freq": "SAVE_FREQ",
+    "power_cap_w": "POWER_CAP_W",
     "resume_path": "RESUME_FROM_CHECKPOINT",
     "rollout_n": "ROLLOUT_N",
 }
@@ -68,7 +75,12 @@ ENV_MAP_TRAIN = {
     "rollout_max_batched_tokens": "ROLLOUT_MAX_BATCHED_TOKENS",
     "rollout_max_model_len": "ROLLOUT_MAX_MODEL_LEN",
     "rollout_max_num_seqs": "ROLLOUT_MAX_NUM_SEQS",
+    "enable_chunked_prefill": "ROLLOUT_ENABLE_CHUNKED_PREFILL",
+    "rollout_quantization": "ROLLOUT_QUANTIZATION",
     "enable_grad_checkpointing": "ENABLE_GRAD_CHECKPOINTING",
+    "reward_model_enable": "REWARD_MODEL_ENABLE",
+    "reward_model_name": "RM_MODEL_NAME",
+    "reward_model_micro_batch_size_per_gpu": "RM_MICRO_BATCH_SIZE_PER_GPU",
 }
 
 

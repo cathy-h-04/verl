@@ -796,13 +796,20 @@ def _build_analysis_views(
         )
 
         # Step-level perf memory metrics are broadcast to each phase row for that run-step.
-        phase_perf_cols = ["run_id", "global_step_canonical", "metric_perf_max_memory_allocated_gb"]
+        phase_perf_cols = [
+            "run_id",
+            "global_step_canonical",
+            "metric_perf_max_memory_allocated_gb",
+            "metric_perf_max_memory_reserved_gb",
+        ]
         phase_perf_df = _ensure_columns(wide_df.copy(), phase_perf_cols)[phase_perf_cols].rename(
-            columns={"metric_perf_max_memory_allocated_gb": "max_memory_allocated_gb"}
+            columns={
+                "metric_perf_max_memory_allocated_gb": "max_memory_allocated_gb",
+                "metric_perf_max_memory_reserved_gb": "max_memory_reserved_gb",
+            }
         )
-        phase_perf_df["max_memory_allocated_gb"] = pd.to_numeric(
-            phase_perf_df["max_memory_allocated_gb"], errors="coerce"
-        )
+        for col in ["max_memory_allocated_gb", "max_memory_reserved_gb"]:
+            phase_perf_df[col] = pd.to_numeric(phase_perf_df[col], errors="coerce")
         phase_fact_view = phase_fact_view.merge(
             phase_perf_df,
             on=["run_id", "global_step_canonical"],
@@ -851,6 +858,7 @@ def _build_analysis_views(
             "power_density_index",
             "avg_power_w",
             "max_memory_allocated_gb",
+            "max_memory_reserved_gb",
             "gpu_util_mean",
             "sm_util_mean",
             "mem_util_mean",
@@ -916,6 +924,7 @@ def _build_analysis_views(
             "metric_perf_throughput",
             "metric_perf_mfu_actor",
             "metric_perf_max_memory_allocated_gb",
+            "metric_perf_max_memory_reserved_gb",
             "metric_rollout_straggler_ratio",
             "metric_rollout_sync_efficiency",
         ]
@@ -925,11 +934,19 @@ def _build_analysis_views(
                 "metric_perf_throughput": "throughput_tokens_s",
                 "metric_perf_mfu_actor": "mfu_actor",
                 "metric_perf_max_memory_allocated_gb": "max_memory_allocated_gb",
+                "metric_perf_max_memory_reserved_gb": "max_memory_reserved_gb",
                 "metric_rollout_straggler_ratio": "straggler_ratio",
                 "metric_rollout_sync_efficiency": "sync_efficiency",
             }
         )
-        for col in ["throughput_tokens_s", "mfu_actor", "max_memory_allocated_gb", "straggler_ratio", "sync_efficiency"]:
+        for col in [
+            "throughput_tokens_s",
+            "mfu_actor",
+            "max_memory_allocated_gb",
+            "max_memory_reserved_gb",
+            "straggler_ratio",
+            "sync_efficiency",
+        ]:
             perf_df[col] = pd.to_numeric(perf_df[col], errors="coerce")
 
         step_fact_view = step_fact_view.merge(
@@ -984,6 +1001,7 @@ def _build_analysis_views(
             "throughput_tokens_s",
             "mfu_actor",
             "max_memory_allocated_gb",
+            "max_memory_reserved_gb",
             "straggler_ratio",
             "sync_efficiency",
             "step_j_per_output_token",
@@ -1037,6 +1055,10 @@ def _build_analysis_views(
                     median_step_j_per_output_token=("step_j_per_output_token", "median"),
                     mean_rollout_j_per_output_token=("rollout_j_per_output_token", "mean"),
                     mean_train_j_per_effective_token=("train_j_per_effective_token", "mean"),
+                    mean_max_memory_allocated_gb=("max_memory_allocated_gb", "mean"),
+                    max_max_memory_allocated_gb=("max_memory_allocated_gb", "max"),
+                    mean_max_memory_reserved_gb=("max_memory_reserved_gb", "mean"),
+                    max_max_memory_reserved_gb=("max_memory_reserved_gb", "max"),
                 )
                 .reset_index()
             )

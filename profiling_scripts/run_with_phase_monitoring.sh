@@ -33,11 +33,24 @@ TOTAL_EPOCHS="${TOTAL_EPOCHS:-${2:-1}}"
 POLL_INTERVAL="${POLL_INTERVAL:-${3:-1}}"
 GRANULARITY="${GRANULARITY:-${4:-phase}}"  # 'phase' or 'operation'
 MODEL_NAME="${MODEL_NAME:-${5:-Qwen/Qwen2.5-7B-Instruct}}"
-POLICY="${POLICY:-${6:-ppo}}"  # ppo | remax
+POLICY="${POLICY:-${6:-ppo}}"  # ppo | remax | grpo | sft
 NNODES="${NNODES:-${7:-1}}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-${8:-1}}"
 DATASET_NAME="${DATASET_NAME:-${9:-gsm8k}}"
 GPU_ID=0
+POWER_CAP_W_RAW="${POWER_CAP_W:-}"
+POWER_CAP_W_EFFECTIVE=""
+POWER_CAP_APPLIED=0
+declare -A POWER_CAP_ORIG_LIMITS
+
+case "${POWER_CAP_W_RAW,,}" in
+    ""|"0"|"default"|"none"|"null"|"off")
+        POWER_CAP_W_EFFECTIVE=""
+        ;;
+    *)
+        POWER_CAP_W_EFFECTIVE="$POWER_CAP_W_RAW"
+        ;;
+esac
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -116,7 +129,47 @@ echo "Model: $MODEL_NAME"
 echo "Policy: $POLICY"
 echo "Nodes: $NNODES (gpus per node: $N_GPUS_PER_NODE)"
 echo "Dataset: $DATASET_NAME"
+if [ -n "$POWER_CAP_W_EFFECTIVE" ]; then
+    echo "Requested Power Cap: ${POWER_CAP_W_EFFECTIVE}W"
+else
+    echo "Requested Power Cap: default (no cap)"
+fi
 echo "=========================================="
+
+# -------------------- Optional GPU Power Cap --------------------
+if [ -n "$POWER_CAP_W_EFFECTIVE" ]; then
+    if [[ ! "$POWER_CAP_W_EFFECTIVE" =~ ^[0-9]+$ ]]; then
+        echo "WARNING: POWER_CAP_W must be an integer watts value; got '$POWER_CAP_W_EFFECTIVE'. Ignoring."
+    elif ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "WARNING: nvidia-smi not found; cannot apply POWER_CAP_W."
+    else
+        readarray -t GPU_INDICES < <(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | xargs -n1 echo)
+        if [ "${#GPU_INDICES[@]}" -eq 0 ]; then
+            echo "WARNING: No GPUs visible to nvidia-smi; cannot apply POWER_CAP_W."
+        else
+            echo "Applying power cap ${POWER_CAP_W_EFFECTIVE}W to visible GPUs: ${GPU_INDICES[*]}"
+            for IDX in "${GPU_INDICES[@]}"; do
+                ORIG_LIMIT_RAW="$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits -i "$IDX" 2>/dev/null | head -1)"
+                ORIG_LIMIT="$(echo "$ORIG_LIMIT_RAW" | awk '{print int($1)}')"
+                if [ -n "$ORIG_LIMIT" ]; then
+                    POWER_CAP_ORIG_LIMITS["$IDX"]="$ORIG_LIMIT"
+                fi
+
+                CAP_SET_OUTPUT="$(nvidia-smi -pl "$POWER_CAP_W_EFFECTIVE" -i "$IDX" 2>&1)"
+                if [ $? -eq 0 ]; then
+                    POWER_CAP_APPLIED=1
+                    VERIFY_LINE="$(nvidia-smi --query-gpu=power.limit,enforced.power.limit,clocks_throttle_reasons.sw_power_cap --format=csv,noheader -i "$IDX" 2>/dev/null | head -1)"
+                    echo "Power-cap verification (gpu $IDX): $VERIFY_LINE"
+                else
+                    echo "WARNING: Failed to set power cap on gpu $IDX. nvidia-smi output: $CAP_SET_OUTPUT"
+                fi
+            done
+            if [ "$POWER_CAP_APPLIED" -ne 1 ]; then
+                echo "WARNING: POWER_CAP_W was requested but could not be applied on any GPU."
+            fi
+        fi
+    fi
+fi
 
 # -------------------- Cleanup --------------------
 cleanup() {
@@ -135,6 +188,14 @@ cleanup() {
         ray stop 2>/dev/null || true
     fi
 
+    if [ "$POWER_CAP_APPLIED" -eq 1 ] && command -v nvidia-smi >/dev/null 2>&1; then
+        echo "Restoring original GPU power limits..."
+        for IDX in "${!POWER_CAP_ORIG_LIMITS[@]}"; do
+            ORIG_LIMIT="${POWER_CAP_ORIG_LIMITS[$IDX]}"
+            nvidia-smi -pl "$ORIG_LIMIT" -i "$IDX" >/dev/null 2>&1 || true
+        done
+    fi
+
     # Remove phase state file ONLY (CSV + JSONL are data)
     rm -f "${MONITORING_DIR}/phase_state_${EXPERIMENT_NAME}.json"
 
@@ -151,7 +212,22 @@ echo ""
 echo "Starting training..."
 echo ""
 
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-run_verl_train_nonval.sh}"
+if [ -z "${TRAIN_SCRIPT:-}" ]; then
+    POLICY_NORMALIZED="$(echo "${POLICY:-ppo}" | tr '[:upper:]' '[:lower:]')"
+    TRAIN_SCRIPT="run_verl_train_nonval.sh"
+    if [ "$POLICY_NORMALIZED" = "sft" ]; then
+        TRAIN_SCRIPT="run_verl_train_sft_nonval.sh"
+    fi
+    case "${USE_VALIDATION:-}" in
+        1|true|TRUE|yes|YES)
+            if [ "$POLICY_NORMALIZED" = "sft" ]; then
+                TRAIN_SCRIPT="run_verl_train_sft_val.sh"
+            else
+                TRAIN_SCRIPT="run_verl_train_val.sh"
+            fi
+            ;;
+    esac
+fi
 
 export PYTHONUNBUFFERED=1
 export TRAIN_LOG_FILE="${SCRATCH_DIR}/logs/${EXPERIMENT_NAME}.log"

@@ -84,7 +84,7 @@ if [ -z "$REQUESTED_GPUS_PER_NODE" ]; then
     echo "WARNING: SLURM_GPUS_PER_NODE not set; defaulting to 1 for Ray startup."
     REQUESTED_GPUS_PER_NODE=1
 fi
-
+export REQUESTED_GPUS_PER_NODE
 
 # Extract the run corresponding to this specific array task
 CONFIG_EXPORTS=$(python3 "${SCRIPT_DIR}/config_utils.py" export --config "$RUNS_FILE" --index "$TASK_ID")
@@ -101,21 +101,11 @@ else
     MOVE_CHECKPOINTS="true"
 fi
 
-MAX_PARAM_GPUS=$(python3 "${SCRIPT_DIR}/config_utils.py" max-gpus --config "$RUNS_FILE")
-
-if [ "$REQUESTED_GPUS_PER_NODE" -lt "$MAX_PARAM_GPUS" ]; then
-    echo "ERROR: Requested GPUs per node ($REQUESTED_GPUS_PER_NODE) is less than max GPUS in RUNS_FILE ($MAX_PARAM_GPUS)."
-    echo "Fix: increase Slurm GPU request or lower GPUS in $RUNS_FILE."
+if ! VALIDATION_EXPORTS=$(python3 "${SCRIPT_DIR}/validate_ppo_config.py" --emit-exports); then
+    echo "ERROR: unified pre-run validator failed."
     exit 1
 fi
-if [ -n "${N_GPUS_PER_NODE:-}" ] && [ "$REQUESTED_GPUS_PER_NODE" -gt "$N_GPUS_PER_NODE" ]; then
-    echo "WARNING: Slurm requested $REQUESTED_GPUS_PER_NODE GPU(s) but run requests only $N_GPUS_PER_NODE GPU(s)."
-    echo "This will leave GPUs idle. Set gpus_per_node to match or lower --gres."
-    if [ "${STRICT_GPU_MATCH:-0}" = "1" ]; then
-        echo "ERROR: STRICT_GPU_MATCH=1 and GPU mismatch detected."
-        exit 1
-    fi
-fi
+eval "$VALIDATION_EXPORTS"
 
 if [ "${PREFLIGHT_ONLY:-0}" = "1" ]; then
     echo "PREFLIGHT_ONLY=1: config checks passed; exiting before runtime."
@@ -150,8 +140,15 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
     echo "RUNS_FILE=${RUNS_FILE}"
     echo "RUN_CONFIG_NAME=${RUN_CONFIG_NAME:-}"
     echo "BASE_EXPERIMENT_NAME=${BASE_EXPERIMENT_NAME:-}"
+    echo "ROLLOUT_MAX_BATCHED_TOKENS=${ROLLOUT_MAX_BATCHED_TOKENS}"
+    echo "ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN}"
+    echo "ROLLOUT_ENABLE_CHUNKED_PREFILL=${ROLLOUT_ENABLE_CHUNKED_PREFILL}"
     echo "REQUESTED_GPUS_PER_NODE=${REQUESTED_GPUS_PER_NODE}"
+    echo "RUN_GPUS_PER_NODE=${RUN_GPUS_PER_NODE}"
     echo "MAX_PARAM_GPUS=${MAX_PARAM_GPUS}"
+    echo "RAY_CPU_PER_GPU_BUNDLE=${RAY_CPU_PER_GPU_BUNDLE}"
+    echo "SLURM_CPUS_PER_TASK_EFFECTIVE=${SLURM_CPUS_PER_TASK_EFFECTIVE}"
+    echo "REQUIRED_CPUS_PER_NODE=${REQUIRED_CPUS_PER_NODE}"
     echo "HEAD_NODE=${head_node}"
     echo "HEAD_NODE_IP=${head_node_ip}"
     echo "RAY_PORT=${RAY_PORT}"
@@ -404,10 +401,18 @@ if [[ "$SLURM_JOB_NUM_NODES" -gt 1 ]]; then
 fi
 
 # 6. Launch the profiling run
+POLICY_NORMALIZED="$(echo "${POLICY:-ppo}" | tr '[:upper:]' '[:lower:]')"
 TRAIN_SCRIPT="run_verl_train_nonval.sh"
+if [ "$POLICY_NORMALIZED" = "sft" ]; then
+    TRAIN_SCRIPT="run_verl_train_sft_nonval.sh"
+fi
 case "${USE_VALIDATION:-}" in
     1|true|TRUE|yes|YES)
-        TRAIN_SCRIPT="run_verl_train_val.sh"
+        if [ "$POLICY_NORMALIZED" = "sft" ]; then
+            TRAIN_SCRIPT="run_verl_train_sft_val.sh"
+        else
+            TRAIN_SCRIPT="run_verl_train_val.sh"
+        fi
         ;;
 esac
 export TRAIN_SCRIPT

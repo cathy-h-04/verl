@@ -124,6 +124,72 @@ TABLE_FILES = {
     "integrity_view": "integrity_view.parquet",
 }
 
+
+def _expected_gpu_count_for_run(run_id: str, slurm_config: Dict[str, Any]) -> Optional[int]:
+    configured = _safe_int(slurm_config.get("gpus_per_node")) if isinstance(slurm_config, dict) else None
+    if configured is not None and configured > 0:
+        return configured
+    rid = str(run_id).lower()
+    if "2gpu_" in rid:
+        return 2
+    if "4gpu_" in rid:
+        return 4
+    return None
+
+
+def _nvml_device_key(rec: Dict[str, Any]) -> Optional[str]:
+    gpu_uuid = rec.get("gpu_uuid")
+    if gpu_uuid not in (None, ""):
+        return str(gpu_uuid)
+    gpu_index = rec.get("gpu_index")
+    if gpu_index is not None:
+        return f"gpu_index:{gpu_index}"
+    return None
+
+
+def _infer_active_nvml_device_keys(
+    nvml_periodic_records: List[Dict[str, Any]],
+    expected_gpu_count: Optional[int],
+) -> Optional[set[str]]:
+    """Infer active GPU devices when extra idle GPUs are also polled.
+
+    The current monitoring setup may poll all 4 local GPUs even for 2-GPU jobs.
+    We rank devices by mean power first, then mean utilization, and keep the
+    expected number of active GPUs for the run.
+    """
+    if expected_gpu_count is None or expected_gpu_count <= 0:
+        return None
+
+    device_rows: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    for rec in nvml_periodic_records:
+        key = _nvml_device_key(rec)
+        if key is None:
+            continue
+        power_mw = _safe_float(rec.get("gpu_power_mW"))
+        util_pct = _safe_float(rec.get("gpu_util_pct"))
+        device_rows[key].append(
+            (
+                float(power_mw) if power_mw is not None else float("-inf"),
+                float(util_pct) if util_pct is not None else float("-inf"),
+            )
+        )
+
+    if not device_rows:
+        return None
+    if len(device_rows) <= expected_gpu_count:
+        return set(device_rows.keys())
+
+    ranked_rows = []
+    for key, vals in device_rows.items():
+        power_vals = [p for p, _ in vals if pd.notna(p) and p != float("-inf")]
+        util_vals = [u for _, u in vals if pd.notna(u) and u != float("-inf")]
+        mean_power = sum(power_vals) / len(power_vals) if power_vals else float("-inf")
+        mean_util = sum(util_vals) / len(util_vals) if util_vals else float("-inf")
+        ranked_rows.append((key, mean_power, mean_util))
+
+    ranked_rows.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
+    return {key for key, _, _ in ranked_rows[:expected_gpu_count]}
+
 @dataclass
 class RunQuality:
     run_dir: str
@@ -294,6 +360,12 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
                 "rapl_periodic": _read_jsonl(run_dir / "rapl_periodic.jsonl"),
             }
 
+            expected_gpu_count = _expected_gpu_count_for_run(run_id, slurm_config)
+            active_nvml_device_keys = _infer_active_nvml_device_keys(
+                read_map["nvml_periodic"].records,
+                expected_gpu_count=expected_gpu_count,
+            )
+
             for key, val in read_map.items():
                 if val.parse_errors > 0:
                     quality.parse_error_files[key] = val.parse_errors
@@ -371,6 +443,13 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
                 "slurm_partition": slurm_config.get("partition"),
                 "slurm_nodes": slurm_config.get("nodes"),
                 "slurm_gpus_per_node": slurm_config.get("gpus_per_node"),
+                "expected_gpu_count": expected_gpu_count,
+                "active_nvml_device_count": (len(active_nvml_device_keys) if active_nvml_device_keys is not None else None),
+                "active_nvml_device_ids_json": (
+                    json.dumps(sorted(active_nvml_device_keys), ensure_ascii=True)
+                    if active_nvml_device_keys is not None
+                    else None
+                ),
                 "slurm_cpus_per_task": slurm_config.get("cpus_per_task"),
                 "slurm_mem": slurm_config.get("mem"),
                 "run_config_json": json.dumps(run_config, ensure_ascii=True, default=_json_default),
@@ -514,6 +593,8 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
                     if source == "nvml":
                         row["device_kind"] = "gpu"
                         row["device_id"] = row.get("gpu_uuid") or (f"gpu_index:{row.get('gpu_index')}" if row.get("gpu_index") is not None else None)
+                        if active_nvml_device_keys is not None and row["device_id"] not in active_nvml_device_keys:
+                            continue
                     else:
                         row["device_kind"] = "rapl"
                         row["device_id"] = row.get("rapl_domain") or row.get("domain_path")
@@ -545,9 +626,15 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
             add_hw_rows(read_map["nvml_periodic"].records, "nvml", "periodic")
             add_hw_rows(read_map["rapl_periodic"].records, "rapl", "periodic")
 
-            phase_rows_local, pair_rows_local, boundary_pair_integrity, boundary_pair_total, boundary_pair_valid = (
-                build_boundary_integrity_outputs(run_id=run_id, run_boundary_rows_local=run_boundary_rows_local)
-            )
+            (
+                phase_rows_local,
+                pair_rows_local,
+                boundary_pair_integrity,
+                boundary_pair_total,
+                boundary_pair_valid,
+                terminal_start_only_boundary_exception,
+                terminal_start_only_invalid_pair_count,
+            ) = build_boundary_integrity_outputs(run_id=run_id, run_boundary_rows_local=run_boundary_rows_local)
             phase_instance_rows.extend(phase_rows_local)
             boundary_pair_rows.extend(pair_rows_local)
 
@@ -558,6 +645,8 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
             run_checks["boundary_pair_integrity"] = boundary_pair_integrity
             run_checks["boundary_pair_total"] = boundary_pair_total
             run_checks["boundary_pair_valid"] = boundary_pair_valid
+            run_checks["terminal_start_only_boundary_exception"] = terminal_start_only_boundary_exception
+            run_checks["terminal_start_only_invalid_pair_count"] = terminal_start_only_invalid_pair_count
             ingestion_checks_rows.append(run_checks)
 
             observed_steps = [
@@ -707,6 +796,8 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
             "boundary_pair_integrity",
             "boundary_pair_total",
             "boundary_pair_valid",
+            "terminal_start_only_boundary_exception",
+            "terminal_start_only_invalid_pair_count",
         ],
     )
     phase_instances_df = _ensure_columns(
@@ -735,10 +826,12 @@ def build_datasets(results_root: Path, output_root: Path, overwrite: bool, inclu
             "phase_instance_id",
             "source",
             "device_id",
+            "global_step_canonical",
             "start_count",
             "end_count",
             "row_count",
             "is_valid_pair",
+            "is_terminal_start_only_pair",
         ],
     )
     metrics_long_df = _ensure_columns(

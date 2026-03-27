@@ -4,10 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="${SLURM_SCRIPT:-}"
 CHECK_ONLY=0
+SMOKE_MODE=0
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -smoke|--smoke)
+      SMOKE_MODE=1
+      shift
+      ;;
     --check)
       CHECK_ONLY=1
       shift
@@ -65,12 +70,50 @@ fi
 SBATCH_ARGS=()
 MAIL_ARGS=()
 if [ -n "${SLURM_CONFIG_PATH:-}" ] && [ -f "${SLURM_CONFIG_PATH:-}" ]; then
-  readarray -t SBATCH_ARGS < <(python3 "${SCRIPT_DIR}/slurm_config_utils.py" sbatch-args --config "$SLURM_CONFIG_PATH")
+readarray -t SBATCH_ARGS < <(python3 "${SCRIPT_DIR}/slurm_config_utils.py" sbatch-args --config "$SLURM_CONFIG_PATH")
   readarray -t MAIL_ARGS < <(python3 "${SCRIPT_DIR}/slurm_config_utils.py" mail-args --config "$SLURM_CONFIG_PATH")
 fi
 
+# Auto-enable exclusive node allocation for 2-GPU jobs unless already requested.
+# Skip this in smoke mode to improve scheduling latency for quick checks.
+REQUESTED_GPUS_PER_NODE=""
+HAS_EXCLUSIVE_FLAG=0
+for ((i=0; i<${#SBATCH_ARGS[@]}; i++)); do
+  arg="${SBATCH_ARGS[$i]}"
+  case "$arg" in
+    --exclusive)
+      HAS_EXCLUSIVE_FLAG=1
+      ;;
+    --gpus-per-node=*)
+      REQUESTED_GPUS_PER_NODE="${arg#*=}"
+      ;;
+    --gpus=*)
+      REQUESTED_GPUS_PER_NODE="${arg#*=}"
+      ;;
+    --gres=*)
+      gres="${arg#*=}"
+      if [[ "$gres" == gpu:* ]]; then
+        REQUESTED_GPUS_PER_NODE="${gres#gpu:}"
+      fi
+      ;;
+    --gres)
+      next="${SBATCH_ARGS[$((i+1))]:-}"
+      if [[ "$next" == gpu:* ]]; then
+        REQUESTED_GPUS_PER_NODE="${next#gpu:}"
+      fi
+      ;;
+  esac
+done
+
+if [ "$SMOKE_MODE" -eq 0 ] && [ "$HAS_EXCLUSIVE_FLAG" -eq 0 ] && [ "$REQUESTED_GPUS_PER_NODE" = "2" ]; then
+  SBATCH_ARGS+=(--exclusive)
+  echo "INFO: Auto-applying --exclusive for 2-GPU request."
+elif [ "$SMOKE_MODE" -eq 1 ] && [ "$REQUESTED_GPUS_PER_NODE" = "2" ]; then
+  echo "INFO: Smoke mode enabled; skipping auto --exclusive for 2-GPU request."
+fi
+
 if [ "${#MAIL_ARGS[@]}" -eq 0 ]; then
-  MAIL_ARGS=(--mail-user="cathyhou@college.harvard.edu" --mail-type=FAIL,TIME_LIMIT,END,ARRAY_TASKS)
+  MAIL_ARGS=(--mail-user="cathyhou@college.harvard.edu" --mail-type=FAIL,TIME_LIMIT,BEGIN,END,ARRAY_TASKS)
 fi
 
 EXPORT_VARS="ALL,RUNS_FILE=$RUNS_FILE,SUBMIT_SCRIPT_DIR=$SCRIPT_DIR"
@@ -81,6 +124,7 @@ fi
 if [ "$CHECK_ONLY" -eq 1 ]; then
   echo "CHECK: running local preflight for $NUM_LINES run(s) with $SLURM_SCRIPT"
   REQUESTED_GPUS_PER_NODE=""
+  REQUESTED_CPUS_PER_TASK=""
   for ((i=0; i<${#SBATCH_ARGS[@]}; i++)); do
     arg="${SBATCH_ARGS[$i]}"
     case "$arg" in
@@ -102,12 +146,29 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
           REQUESTED_GPUS_PER_NODE="${next#gpu:}"
         fi
         ;;
+      --cpus-per-task=*)
+        REQUESTED_CPUS_PER_TASK="${arg#*=}"
+        ;;
+      --cpus-per-task)
+        REQUESTED_CPUS_PER_TASK="${SBATCH_ARGS[$((i+1))]:-}"
+        ;;
+      -c)
+        REQUESTED_CPUS_PER_TASK="${SBATCH_ARGS[$((i+1))]:-}"
+        ;;
+      -c[0-9]*)
+        REQUESTED_CPUS_PER_TASK="${arg#-c}"
+        ;;
     esac
   done
   if [ -z "$REQUESTED_GPUS_PER_NODE" ]; then
     REQUESTED_GPUS_PER_NODE=1
   fi
+  if [ -z "$REQUESTED_CPUS_PER_TASK" ]; then
+    REQUESTED_CPUS_PER_TASK="$(nproc)"
+    echo "CHECK: cpus-per-task not found in sbatch args; defaulting to nproc=$REQUESTED_CPUS_PER_TASK"
+  fi
   echo "CHECK: using REQUESTED_GPUS_PER_NODE=$REQUESTED_GPUS_PER_NODE"
+  echo "CHECK: using REQUESTED_CPUS_PER_TASK=$REQUESTED_CPUS_PER_TASK"
 
   for idx in $(seq 1 "$NUM_LINES"); do
     echo "CHECK: preflight run $idx/$NUM_LINES"
@@ -115,6 +176,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
       RUNS_FILE="$RUNS_FILE" \
       SLURM_ARRAY_TASK_ID="$idx" \
       SLURM_GPUS_PER_NODE="$REQUESTED_GPUS_PER_NODE" \
+      SLURM_CPUS_PER_TASK="$REQUESTED_CPUS_PER_TASK" \
       PREFLIGHT_ONLY=1 \
       bash "$SLURM_SCRIPT"
   done
