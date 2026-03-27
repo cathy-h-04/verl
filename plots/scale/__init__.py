@@ -1,0 +1,1 @@
+"""Scaling-oriented thesis plots."""
